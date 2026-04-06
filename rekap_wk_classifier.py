@@ -439,7 +439,7 @@ def detect_file_type(files):
 # MAIN UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.markdown('<div class="main-header">🗺️ WK Classifier</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">🗺️ WK Classifier by Dwi Rahmah</div>', unsafe_allow_html=True)
 st.markdown('<div class="accent-bar"></div>', unsafe_allow_html=True)
 st.markdown('<div class="main-sub">Klasifikasi titik sumur berdasarkan Wilayah Kerja (WK) · Mendukung KML / KMZ / SHP</div>', unsafe_allow_html=True)
 
