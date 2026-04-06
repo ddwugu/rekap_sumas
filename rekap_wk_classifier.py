@@ -18,8 +18,8 @@ import re
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="WK Classifier",
-    page_icon="🗺️",
+    page_title="Recap Classifier",
+    page_icon="by Dwi Rahmah",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
