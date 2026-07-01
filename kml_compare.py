@@ -94,56 +94,42 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
                 candidates.append((d, i, j))
     candidates.sort()  # shortest distance first
 
-    # Enhanced matching: prioritize identical coordinates (allow many-to-many for distance=0)
-    matched_a = {}  # a_idx → (b_idx, dist) for 1-to-1 distance>0
-    matched_a_set = set()  # All matched A indices (includes distance=0 many-to-many)
-    matched_b = set()  # All matched B indices
-    max_possible_overlap = min(len(recs_a), len(recs_b))  # Cap for overlap count
+    # Strict 1-to-1 matching with prioritization: distance=0 first, then greedy
+    matched_a = {}  # a_idx → (b_idx, dist)
+    matched_b = set()
     
-    # First pass: match ALL distance-0 pairs (many-to-many allowed)
-    # This ensures duplicates are counted as OVERLAP
+    # First pass: greedy match ALL distance-0 pairs (sorted by distance=0)
+    # Ensures all perfectly aligned points are matched first
     zero_pairs = [(d, i, j) for d, i, j in candidates if d == 0]
     for d, i, j in zero_pairs:
-        # Even with many-to-many, cap at max_possible_overlap
-        if len(matched_a_set) < max_possible_overlap:
-            matched_a_set.add(i)
+        if i not in matched_a and j not in matched_b:
+            matched_a[i] = (j, d)
             matched_b.add(j)
     
-    # Second pass: greedy 1-to-1 match for distance > 0 (strict)
-    # Only match if we haven't reached max possible overlap yet
+    # Second pass: greedy match remaining with distance > 0
+    # Strict 1-to-1 for all
     nonzero_pairs = [(d, i, j) for d, i, j in candidates if d > 0]
     for d, i, j in nonzero_pairs:
-        if i not in matched_a_set and j not in matched_b and len(matched_a_set) < max_possible_overlap:
+        if i not in matched_a and j not in matched_b:
             matched_a[i] = (j, d)
-            matched_a_set.add(i)
             matched_b.add(j)
 
     # Build rows for A
     rows = []
     for i, ra in enumerate(recs_a):
-        if i in matched_a_set:  # Check if matched (1-to-1 or many-to-many distance=0)
-            if i in matched_a:  # If in dict, it's distance>0
-                j, d = matched_a[i]
-            else:  # If in set but not dict, find best match among distance=0 pairs
-                best_d, best_j = None, None
-                for cand_d, cand_i, cand_j in zero_pairs:
-                    if cand_i == i:
-                        if best_d is None or cand_d < best_d:
-                            best_d, best_j = cand_d, cand_j
-                j, d = best_j, best_d if best_j is not None else (None, None)
-            
-            if j is not None:
-                rb = recs_b[j]
-                rows.append({
-                    f"Nama ({label_a})":          ra["name"],
-                    f"Latitude ({label_a})":      ra["lat"],
-                    f"Longitude ({label_a})":     ra["lon"],
-                    f"Nama Pasangan ({label_b})": rb["name"],
-                    f"Latitude ({label_b})":      rb["lat"],
-                    f"Longitude ({label_b})":     rb["lon"],
-                    "Jarak (m)":                  round(d, 2),
-                    "Keterangan":                 "✅ OVERLAP",
-                })
+        if i in matched_a:
+            j, d = matched_a[i]
+            rb = recs_b[j]
+            rows.append({
+                f"Nama ({label_a})":          ra["name"],
+                f"Latitude ({label_a})":      ra["lat"],
+                f"Longitude ({label_a})":     ra["lon"],
+                f"Nama Pasangan ({label_b})": rb["name"],
+                f"Latitude ({label_b})":      rb["lat"],
+                f"Longitude ({label_b})":     rb["lon"],
+                "Jarak (m)":                  round(d, 2),
+                "Keterangan":                 "✅ OVERLAP",
+            })
         else:
             # Find nearest B for info (not matched)
             best_d, best_j = None, None
