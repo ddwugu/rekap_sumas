@@ -98,18 +98,22 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     matched_a = {}  # a_idx → (b_idx, dist) for 1-to-1 distance>0
     matched_a_set = set()  # All matched A indices (includes distance=0 many-to-many)
     matched_b = set()  # All matched B indices
+    max_possible_overlap = min(len(recs_a), len(recs_b))  # Cap for overlap count
     
     # First pass: match ALL distance-0 pairs (many-to-many allowed)
     # This ensures duplicates are counted as OVERLAP
     zero_pairs = [(d, i, j) for d, i, j in candidates if d == 0]
     for d, i, j in zero_pairs:
-        matched_a_set.add(i)
-        matched_b.add(j)
+        # Even with many-to-many, cap at max_possible_overlap
+        if len(matched_a_set) < max_possible_overlap:
+            matched_a_set.add(i)
+            matched_b.add(j)
     
     # Second pass: greedy 1-to-1 match for distance > 0 (strict)
+    # Only match if we haven't reached max possible overlap yet
     nonzero_pairs = [(d, i, j) for d, i, j in candidates if d > 0]
     for d, i, j in nonzero_pairs:
-        if i not in matched_a_set and j not in matched_b:
+        if i not in matched_a_set and j not in matched_b and len(matched_a_set) < max_possible_overlap:
             matched_a[i] = (j, d)
             matched_a_set.add(i)
             matched_b.add(j)
