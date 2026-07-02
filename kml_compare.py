@@ -80,52 +80,77 @@ def parse_kml(kml_bytes, label="File"):
 
 def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     """
-    Simple distance-based classification:
-    - OVERLAP: distance ≤ threshold ke nearest counterpart  
-    - HANYA DI: distance > threshold ke nearest counterpart
+    Strict 1-to-1 matching:
+    - Build all pairs within threshold
+    - Sort by distance (smallest first)
+    - Greedy assign: each A max 1 match, each B max 1 match
     
-    No matching needed. Just find nearest and classify by distance.
+    Result: OVERLAP + HANYA DI = total points (balanced)
     """
+    
+    # Build all candidate pairs within threshold
+    candidates = []
+    for i, ra in enumerate(recs_a):
+        for j, rb in enumerate(recs_b):
+            d = haversine_m(ra["lat"], ra["lon"], rb["lat"], rb["lon"])
+            if d <= threshold_m:
+                candidates.append((d, i, j))
+    
+    candidates.sort()  # Sort by distance (shortest first)
+    
+    # Greedy 1-to-1 assignment
+    matched_a = {}  # a_idx → (b_idx, dist)
+    matched_b = set()  # b_idx set
+    
+    for d, i, j in candidates:
+        if i not in matched_a and j not in matched_b:
+            matched_a[i] = (j, d)
+            matched_b.add(j)
     
     # Build rows for A
     rows_a = []
     for i, ra in enumerate(recs_a):
-        # Find nearest B
-        best_d, best_j = None, None
-        for j, rb in enumerate(recs_b):
-            d = haversine_m(ra["lat"], ra["lon"], rb["lat"], rb["lon"])
-            if best_d is None or d < best_d:
-                best_d, best_j = d, j
+        if i in matched_a:
+            j, d = matched_a[i]
+            rb = recs_b[j]
+            keterangan = "✅ OVERLAP"
+        else:
+            # Find nearest B for reference (even if beyond threshold)
+            best_d, best_j = None, None
+            for j, rb in enumerate(recs_b):
+                d = haversine_m(ra["lat"], ra["lon"], rb["lat"], rb["lon"])
+                if best_d is None or d < best_d:
+                    best_d, best_j = d, j
+            j, d = best_j, best_d if best_j is not None else (None, None)
+            rb = recs_b[j] if j is not None else {"name": "-", "lat": None, "lon": None}
+            keterangan = "❌ HANYA DI FILE 1"
         
-        if best_j is not None:
-            rb_near = recs_b[best_j]
-            keterangan = "✅ OVERLAP" if best_d <= threshold_m else "❌ HANYA DI FILE 1"
+        if j is not None:
             rows_a.append({
                 f"Nama ({label_a})":          ra["name"],
                 f"Latitude ({label_a})":      ra["lat"],
                 f"Longitude ({label_a})":     ra["lon"],
-                f"Nama Pasangan ({label_b})": rb_near["name"],
-                f"Latitude ({label_b})":      rb_near["lat"],
-                f"Longitude ({label_b})":     rb_near["lon"],
-                "Jarak (m)":                  round(best_d, 2),
+                f"Nama Pasangan ({label_b})": rb["name"],
+                f"Latitude ({label_b})":      rb["lat"],
+                f"Longitude ({label_b})":     rb["lon"],
+                "Jarak (m)":                  round(d, 2) if d is not None else None,
                 "Keterangan":                 keterangan,
             })
     
     df_a = pd.DataFrame(rows_a)
     
-    # Build rows for B
+    # Build rows for B (unmatched only)
     rows_b = []
     for j, rb in enumerate(recs_b):
-        # Find nearest A
-        best_d, best_i = None, None
-        for i, ra in enumerate(recs_a):
-            d = haversine_m(rb["lat"], rb["lon"], ra["lat"], ra["lon"])
-            if best_d is None or d < best_d:
-                best_d, best_i = d, i
-        
-        if best_i is not None:
-            ra_near = recs_a[best_i]
-            keterangan = "✅ OVERLAP" if best_d <= threshold_m else "⚠️ HANYA DI FILE 2"
+        if j not in matched_b:
+            # Find nearest A for reference
+            best_d, best_i = None, None
+            for i, ra in enumerate(recs_a):
+                d = haversine_m(rb["lat"], rb["lon"], ra["lat"], ra["lon"])
+                if best_d is None or d < best_d:
+                    best_d, best_i = d, i
+            ra_near = recs_a[best_i] if best_i is not None else {"name": "-", "lat": None, "lon": None}
+            
             rows_b.append({
                 f"Nama ({label_a})":          ra_near["name"],
                 f"Latitude ({label_a})":      ra_near["lat"],
@@ -133,8 +158,8 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
                 f"Nama Pasangan ({label_b})": rb["name"],
                 f"Latitude ({label_b})":      rb["lat"],
                 f"Longitude ({label_b})":     rb["lon"],
-                "Jarak (m)":                  round(best_d, 2),
-                "Keterangan":                 keterangan,
+                "Jarak (m)":                  round(best_d, 2) if best_d is not None else None,
+                "Keterangan":                 "⚠️ HANYA DI FILE 2",
             })
     
     df_b = pd.DataFrame(rows_b)
@@ -231,7 +256,7 @@ def to_excel_bytes(df_overlap, df_not_a, df_only_b, label_a, label_b, threshold_
         (f"Total koordinat {label_a}",                                    n_a),
         (f"Total koordinat {label_b}",                                    n_b),
         ("Threshold overlap (meter)",                                      threshold_m),
-        ("Jumlah OVERLAP (enhanced matching)",                             len(df_overlap)),
+        ("Jumlah OVERLAP (1-to-1 matching)",                              len(df_overlap)),
         (f"Hanya di {label_a} (tidak ada pasangan di {label_b})",         len(df_not_a)),
         (f"Hanya di {label_b} (jarak > threshold)",                       len(df_only_b)),
         ("Maks. overlap teoritis = min(File 1, File 2)",                   min(n_a, n_b)),
@@ -254,27 +279,27 @@ def to_excel_bytes(df_overlap, df_not_a, df_only_b, label_a, label_b, threshold_
         ws_ov = wb.create_sheet(safe_sheet_name("OVERLAP"))
         write_sheet(ws_ov, df_overlap,
                     f"KOORDINAT OVERLAP — {label_a} × {label_b}",
-                    f"Threshold: {threshold_m} m  |  Total: {len(df_overlap)} titik  |  Metode: Enhanced matching (prioritas distance=0)")
+                    f"Threshold: {threshold_m} m  |  Total: {len(df_overlap)} titik  |  Metode: Strict 1-to-1 greedy matching")
 
     # Sheet 3: Hanya di A
     if len(df_not_a):
         ws_na = wb.create_sheet(safe_sheet_name(f"Hanya {label_a}"))
         write_sheet(ws_na, df_not_a,
                     f"HANYA DI {label_a.upper()} — tidak ada pasangan di {label_b}",
-                    f"Total: {len(df_not_a)} titik")
+                    f"Total: {len(df_not_a)} titik  |  Jarak > {threshold_m}m ke nearest B")
 
     # Sheet 4: Hanya di B
     if len(df_only_b):
         ws_nb = wb.create_sheet(safe_sheet_name(f"Hanya {label_b}"))
         write_sheet(ws_nb, df_only_b,
                     f"HANYA DI {label_b.upper()} — tidak ada pasangan di {label_a}",
-                    f"Total: {len(df_only_b)} titik  |  Jarak > {threshold_m}m ke nearest A")
+                    f"Total: {len(df_only_b)} titik  |  Tidak match dalam 1-to-1 assignment")
 
     # Sheet 5: Semua Data
     ws_all = wb.create_sheet("Semua Data")
     df_all = pd.concat([df_overlap, df_not_a, df_only_b], ignore_index=True)
-    order = {"✅ OVERLAP": 0, "❌ TIDAK OVERLAP": 1}
-    df_all["_sort"] = df_all["Keterangan"].map(lambda x: order.get(x, 2))
+    order = {"✅ OVERLAP": 0, "❌ HANYA DI FILE 1": 1, "⚠️ HANYA DI FILE 2": 2}
+    df_all["_sort"] = df_all["Keterangan"].map(lambda x: order.get(x, 3))
     df_all = df_all.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
     write_sheet(ws_all, df_all,
                 f"SEMUA DATA — {label_a} × {label_b}",
@@ -288,9 +313,9 @@ def to_excel_bytes(df_overlap, df_not_a, df_only_b, label_a, label_b, threshold_
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 
-st.title("🗺️ KML / KMZ Overlap Checker [ENHANCED]")
-st.caption("Upload 2 file KML/KMZ → deteksi titik tumpang-tindih → export Excel.")
-st.info("✨ **ENHANCED:** Multi-coordinate matching — semua titik identik (distance=0) dijamin OVERLAP, tidak ada yang terlewat")
+st.title("🗺️ KML / KMZ Overlap Checker")
+st.caption("Upload 2 file KML/KMZ → deteksi titik tumpang-tindih (1-to-1) → export Excel.")
+st.info("✨ **STRICT 1-to-1 Matching:** Setiap titik hanya match ke 1 titik lainnya. OVERLAP + HANYA DI = total koordinat ✓")
 
 with st.sidebar:
     st.header("⚙️ Pengaturan")
@@ -306,10 +331,11 @@ with st.sidebar:
         "2. Klik **Proses**\n"
         "3. Download Excel\n\n"
         "**Metode matching:**\n"
-        "**Pass 1:** Match semua distance=0 pairs (prioritas)\n"
-        "**Pass 2:** Greedy match sisa dengan distance > 0\n\n"
-        "Ini memastikan jika File 1 & 2 punya multiple wells "
-        "di lokasi identik, SEMUA matched sebagai OVERLAP."
+        "- Build semua pairs dalam threshold\n"
+        "- Sort by distance (terpendek dulu)\n"
+        "- Greedy assign: 1 titik = 1 match\n\n"
+        "**Hasil balanced:**\n"
+        "OVERLAP + HANYA DI = total points ✓"
     )
 
 col1, col2 = st.columns(2)
@@ -351,48 +377,42 @@ if st.button("🔍 Proses Perbandingan", type="primary", use_container_width=Tru
 
     st.success(f"**{label_a}**: {len(recs_a)} titik  |  **{label_b}**: {len(recs_b)} titik  |  Max overlap teoritis: **{min(len(recs_a), len(recs_b))}**")
 
-    with st.spinner("Menghitung overlap (distance-based)..."):
-        df_a, df_b = build_comparison(recs_a, recs_b, threshold_m, label_a, label_b)
-        df_overlap_a = df_a[df_a["Keterangan"] == "✅ OVERLAP"].reset_index(drop=True)
-        df_only_a   = df_a[df_a["Keterangan"] == "❌ HANYA DI FILE 1"].reset_index(drop=True)
-        df_overlap_b = df_b[df_b["Keterangan"] == "✅ OVERLAP"].reset_index(drop=True)
-        df_only_b   = df_b[df_b["Keterangan"] == "⚠️ HANYA DI FILE 2"].reset_index(drop=True)
+    with st.spinner("Menghitung overlap (1-to-1 matching)..."):
+        df_a, df_b_unmatched = build_comparison(recs_a, recs_b, threshold_m, label_a, label_b)
+        df_overlap = df_a[df_a["Keterangan"] == "✅ OVERLAP"].reset_index(drop=True)
+        df_only_a = df_a[df_a["Keterangan"] == "❌ HANYA DI FILE 1"].reset_index(drop=True)
+        df_only_b = df_b_unmatched  # All unmatched File 2
 
-    # Sanity check
-    assert len(df_overlap_a) <= len(recs_a), "BUG: overlap A melebihi total A!"
-    assert len(df_overlap_b) <= len(recs_b), "BUG: overlap B melebihi total B!"
-    assert len(df_only_b) <= len(recs_b), "BUG: only B melebihi total B!"
-
-    # For metrics and display, use File B perspective (simpler)
-    n_overlap = len(df_overlap_b)
-    n_only_b = len(df_only_b)
+    # Sanity check - math must balance
+    assert len(df_overlap) + len(df_only_a) == len(recs_a), f"BUG: {len(df_overlap)} + {len(df_only_a)} != {len(recs_a)}"
+    assert len(df_overlap) + len(df_only_b) == len(recs_b), f"BUG: {len(df_overlap)} + {len(df_only_b)} != {len(recs_b)}"
     
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric(f"Total {label_a}", len(recs_a))
     m2.metric(f"Total {label_b}", len(recs_b))
-    m3.metric("✅ OVERLAP", n_overlap)
+    m3.metric("✅ OVERLAP", len(df_overlap))
     m4.metric(f"❌ Hanya {label_a}", len(df_only_a))
-    m5.metric(f"⚠️ Hanya {label_b}", n_only_b)
+    m5.metric(f"⚠️ Hanya {label_b}", len(df_only_b))
 
     st.markdown("---")
 
     tab1, tab2, tab3 = st.tabs([
-        f"✅ OVERLAP ({n_overlap})",
+        f"✅ OVERLAP ({len(df_overlap)})",
         f"❌ Hanya {label_a} ({len(df_only_a)})",
-        f"⚠️ Hanya {label_b} ({n_only_b})",
+        f"⚠️ Hanya {label_b} ({len(df_only_b)})",
     ])
     with tab1:
-        st.dataframe(df_overlap_b, use_container_width=True) if n_overlap else st.info("Tidak ada titik overlap.")
+        st.dataframe(df_overlap, use_container_width=True) if len(df_overlap) else st.info("Tidak ada titik overlap.")
     with tab2:
         st.dataframe(df_only_a, use_container_width=True) if len(df_only_a) else st.info(f"Semua titik {label_a} punya pasangan.")
     with tab3:
-        st.dataframe(df_only_b, use_container_width=True) if n_only_b else st.info(f"Semua titik {label_b} punya pasangan.")
+        st.dataframe(df_only_b, use_container_width=True) if len(df_only_b) else st.info(f"Semua titik {label_b} punya pasangan.")
 
     st.markdown("---")
 
     with st.spinner("Generate Excel..."):
         excel_bytes = to_excel_bytes(
-            df_overlap_b, df_only_a, df_only_b,
+            df_overlap, df_only_a, df_only_b,
             label_a, label_b, threshold_m,
             len(recs_a), len(recs_b)
         )
