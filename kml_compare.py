@@ -80,19 +80,14 @@ def parse_kml(kml_bytes, label="File"):
 
 def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     """
-    Enhanced 1-to-1 matching with duplicate coord handling:
-    - For distance=0 (identical coords): many-to-many allowed (match by count)
-    - For distance>0: strict 1-to-1 greedy
+    Strict 1-to-1 matching (no override):
+    - Build all pairs within threshold
+    - Sort by distance (shortest first)
+    - Greedy assign: each point max 1 match
+    - Result: OVERLAP + HANYA DI = total points (always balanced)
     """
     
-    # Group by unique location (rounded to avoid float precision)
-    from collections import defaultdict
-    
-    def round_coord(lat, lon, decimal=4):
-        """Round coords to avoid float precision issues"""
-        return (round(lat, decimal), round(lon, decimal))
-    
-    # Build candidates only for distance <= threshold
+    # Build all candidate pairs within threshold
     candidates = []
     for i, ra in enumerate(recs_a):
         for j, rb in enumerate(recs_b):
@@ -100,25 +95,13 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
             if d <= threshold_m:
                 candidates.append((d, i, j))
     
-    candidates.sort()  # Sort by distance
+    candidates.sort()  # Sort by distance (shortest first)
     
-    # Two-phase matching:
-    # Phase 1: Match all distance=0 pairs (many-to-many allowed)
-    # Phase 2: Strict 1-to-1 for distance>0
+    # Greedy 1-to-1 assignment (strict, no override)
+    matched_a = {}  # a_idx → (b_idx, dist)
+    matched_b = set()  # b_idx set
     
-    matched_a = {}  # For tracking distance>0 matches
-    matched_b = set()  # For tracking ALL matched B
-    
-    zero_pairs = [(d, i, j) for d, i, j in candidates if d == 0]
-    nonzero_pairs = [(d, i, j) for d, i, j in candidates if d > 0]
-    
-    # Phase 1: Match distance-0 (allow many-to-many for identical coords)
-    for d, i, j in zero_pairs:
-        matched_a[i] = (j, d)  # Override allowed for distance=0
-        matched_b.add(j)
-    
-    # Phase 2: Strict 1-to-1 for distance>0
-    for d, i, j in nonzero_pairs:
+    for d, i, j in candidates:
         if i not in matched_a and j not in matched_b:
             matched_a[i] = (j, d)
             matched_b.add(j)
