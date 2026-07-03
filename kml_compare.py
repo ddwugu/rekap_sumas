@@ -243,11 +243,16 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
         
         stat_row += 1
         stats_rows = [
-            ("Total Koordinat dg 3 Nama Sumur", stats_x["dup_3"], stats_y["dup_3"]),
-            ("Total Koordinat dg 2 Nama Sumur", stats_x["dup_2"], stats_y["dup_2"]),
-            ("Total Titik Koordinat Single", stats_x["dup_1"], stats_y["dup_1"]),
-            ("Total Nama Sumur", stats_x["total_nama"], stats_y["total_nama"]),
-            ("Total Koordinat", stats_x["total_koordinat"], stats_y["total_koordinat"]),
+            ("Total Koordinat dg 3 Nama Sumur", 
+             stats_x.get("dup_3", 0), stats_y.get("dup_3", 0)),
+            ("Total Koordinat dg 2 Nama Sumur", 
+             stats_x.get("dup_2", 0), stats_y.get("dup_2", 0)),
+            ("Total Titik Koordinat Single", 
+             stats_x.get("dup_1", 0), stats_y.get("dup_1", 0)),
+            ("Total Nama Sumur", 
+             stats_x.get("total_nama", 0), stats_y.get("total_nama", 0)),
+            ("Total Koordinat", 
+             stats_x.get("total_koordinat", 0), stats_y.get("total_koordinat", 0)),
         ]
         
         for label, val_x, val_y in stats_rows:
