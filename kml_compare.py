@@ -135,21 +135,21 @@ def build_grouped_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
         # Add File A cols (names + count)
         for i in range(max_dup_a):
             if i < len(recs_at_a):
-                row[f"Nama {label_a} {i+1}"] = recs_at_a[i]["name"]
+                row[f"Nama {label_a} - Titik {i+1}"] = recs_at_a[i]["name"]
             else:
-                row[f"Nama {label_a} {i+1}"] = ""
+                row[f"Nama {label_a} - Titik {i+1}"] = ""
         row[f"Jumlah Sumur {label_a}"] = len(recs_at_a)
         
         # Add File B cols (names + count)
         for i in range(max_dup_b):
             if i < len(recs_at_b):
-                row[f"Nama {label_b} {i+1}"] = recs_at_b[i]["name"]
+                row[f"Nama {label_b} - Titik {i+1}"] = recs_at_b[i]["name"]
             else:
-                row[f"Nama {label_b} {i+1}"] = ""
+                row[f"Nama {label_b} - Titik {i+1}"] = ""
         row[f"Jumlah Sumur {label_b}"] = len(recs_at_b)
         
-        # Keterangan
-        row["Keterangan"] = "✅ Overlap" if is_overlap else "❌ Tidak Overlap"
+        # Keterangan (no emoji)
+        row["Keterangan"] = "Overlap" if is_overlap else "Tidak Overlap"
         
         rows.append(row)
     
@@ -191,8 +191,8 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
     thin = Side(style="thin", color="AAAAAA")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     
-    def write_grouped_sheet(ws, df, title, stats_x, stats_y, label_x, label_y):
-        """Write grouped coordinates sheet with statistics"""
+    def write_grouped_sheet(ws, df, title, stats_x, stats_y, label_x, label_y, show_stats=True):
+        """Write grouped coordinates sheet with statistics (2-column layout)"""
         
         # Title
         ws.merge_cells("A1:M1")
@@ -224,7 +224,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
                 # Color by keterangan
                 if "Keterangan" in df.columns and ci == len(df.columns):
                     val_str = str(value) if value else ""
-                    if "Overlap" in val_str:
+                    if "Overlap" in val_str and "Tidak" not in val_str:
                         cell.fill = PatternFill("solid", fgColor=GREEN)
                         cell.font = Font(size=9, bold=True, color="006100")
                     else:
@@ -233,42 +233,59 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
                 else:
                     cell.fill = PatternFill("solid", fgColor=row_bg)
         
-        # Statistics section
-        stat_row = len(df) + 4
-        ws.merge_cells(f"A{stat_row}:C{stat_row}")
-        sc = ws.cell(row=stat_row, column=1, value="STATISTIK")
-        sc.font = Font(bold=True, size=11)
-        sc.fill = PatternFill("solid", fgColor=BLUE_HDR)
-        sc.font = Font(bold=True, size=11, color=WHITE)
-        
-        stat_row += 1
-        stats_rows = [
-            ("Total Koordinat dg 3 Nama Sumur", 
-             stats_x.get("dup_3", 0), stats_y.get("dup_3", 0)),
-            ("Total Koordinat dg 2 Nama Sumur", 
-             stats_x.get("dup_2", 0), stats_y.get("dup_2", 0)),
-            ("Total Titik Koordinat Single", 
-             stats_x.get("dup_1", 0), stats_y.get("dup_1", 0)),
-            ("Total Nama Sumur", 
-             stats_x.get("total_nama", 0), stats_y.get("total_nama", 0)),
-            ("Total Koordinat", 
-             stats_x.get("total_koordinat", 0), stats_y.get("total_koordinat", 0)),
-        ]
-        
-        for label, val_x, val_y in stats_rows:
-            c1 = ws.cell(row=stat_row, column=1, value=label)
-            c1.font = Font(bold=True, size=10)
-            c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+        # Statistics section (only if show_stats is True)
+        if show_stats:
+            stat_row = len(df) + 4
             
-            c2 = ws.cell(row=stat_row, column=2, value=val_x)
-            c2.alignment = Alignment(horizontal="center")
-            c2.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+            # Header: STATISTIK File 1 | File 2
+            ws.cell(row=stat_row, column=1, value="STATISTIK").font = Font(bold=True, size=11)
+            ws.cell(row=stat_row, column=1).fill = PatternFill("solid", fgColor=BLUE_HDR)
+            ws.cell(row=stat_row, column=1).font = Font(bold=True, size=11, color=WHITE)
             
-            c3 = ws.cell(row=stat_row, column=3, value=val_y)
-            c3.alignment = Alignment(horizontal="center")
-            c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+            ws.cell(row=stat_row, column=2, value=label_x).font = Font(bold=True, size=10)
+            ws.cell(row=stat_row, column=2).fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+            ws.cell(row=stat_row, column=2).alignment = Alignment(horizontal="center")
+            
+            ws.cell(row=stat_row, column=3, value=label_y).font = Font(bold=True, size=10)
+            ws.cell(row=stat_row, column=3).fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+            ws.cell(row=stat_row, column=3).alignment = Alignment(horizontal="center")
             
             stat_row += 1
+            
+            stats_rows = [
+                "Total Koordinat dg 3 Nama Sumur",
+                "Total Koordinat dg 2 Nama Sumur",
+                "Total Titik Koordinat Single",
+                "Total Nama Sumur",
+                "Total Koordinat",
+            ]
+            
+            stat_keys = ["dup_3", "dup_2", "dup_1", "total_nama", "total_koordinat"]
+            
+            for label, key in zip(stats_rows, stat_keys):
+                # Label
+                c1 = ws.cell(row=stat_row, column=1, value=label)
+                c1.font = Font(bold=True, size=10)
+                c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                c1.border = border
+                
+                # File 1 value
+                val_x = stats_x.get(key, 0)
+                c2 = ws.cell(row=stat_row, column=2, value=val_x)
+                c2.alignment = Alignment(horizontal="center")
+                c2.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                c2.border = border
+                c2.font = Font(size=10)
+                
+                # File 2 value
+                val_y = stats_y.get(key, 0)
+                c3 = ws.cell(row=stat_row, column=3, value=val_y)
+                c3.alignment = Alignment(horizontal="center")
+                c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                c3.border = border
+                c3.font = Font(size=10)
+                
+                stat_row += 1
         
         # Column widths
         ws.column_dimensions["A"].width = 15
@@ -281,25 +298,25 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
     ws_all = wb.active
     ws_all.title = "Semua Data"
     write_grouped_sheet(ws_all, df_all, f"PERBANDINGAN: {label_a} × {label_b}", 
-                       stats_a, stats_b, label_a, label_b)
+                       stats_a, stats_b, label_a, label_b, show_stats=True)
     
     # Sheet 2: Overlap
     if len(df_overlap) > 0:
         ws_ov = wb.create_sheet("Overlap")
         write_grouped_sheet(ws_ov, df_overlap, f"OVERLAP: {label_a} × {label_b}",
-                           stats_a, stats_b, label_a, label_b)
+                           stats_a, stats_b, label_a, label_b, show_stats=True)
     
-    # Sheet 3: File A only
+    # Sheet 3: File A only (no stats)
     if len(df_file_a_only) > 0:
         ws_a = wb.create_sheet(f"Hanya {label_a}")
         write_grouped_sheet(ws_a, df_file_a_only, f"HANYA {label_a.upper()}",
-                           stats_a, {}, label_a, label_b)
+                           stats_a, {}, label_a, label_b, show_stats=False)
     
-    # Sheet 4: File B only
+    # Sheet 4: File B only (no stats)
     if len(df_file_b_only) > 0:
         ws_b = wb.create_sheet(f"Hanya {label_b}")
         write_grouped_sheet(ws_b, df_file_b_only, f"HANYA {label_b.upper()}",
-                           {}, stats_b, label_a, label_b)
+                           {}, stats_b, label_a, label_b, show_stats=False)
     
     buf = io.BytesIO()
     wb.save(buf)
@@ -363,10 +380,10 @@ if st.button("🔍 Proses Perbandingan", type="primary", use_container_width=Tru
             recs_a, recs_b, threshold_m, label_a, label_b
         )
         
-        df_overlap = df_all[df_all["Keterangan"] == "✅ Overlap"].reset_index(drop=True)
-        df_file_a_only = df_all[(df_all["Keterangan"] == "❌ Tidak Overlap") & 
+        df_overlap = df_all[df_all["Keterangan"] == "Overlap"].reset_index(drop=True)
+        df_file_a_only = df_all[(df_all["Keterangan"] == "Tidak Overlap") & 
                                 (df_all[f"Jumlah Sumur {label_a}"] > 0)].reset_index(drop=True)
-        df_file_b_only = df_all[(df_all["Keterangan"] == "❌ Tidak Overlap") & 
+        df_file_b_only = df_all[(df_all["Keterangan"] == "Tidak Overlap") & 
                                 (df_all[f"Jumlah Sumur {label_b}"] > 0)].reset_index(drop=True)
 
     m1, m2, m3, m4 = st.columns(4)
