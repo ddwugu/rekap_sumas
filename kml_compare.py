@@ -79,9 +79,41 @@ def parse_kml(kml_bytes, label="File"):
     return records
 
 
-def round_coord(lat, lon, decimal=4):
-    """Round coords for grouping"""
-    return (round(lat, decimal), round(lon, decimal))
+def extract_digits(name):
+    """Extract semua digits dari nama"""
+    return ''.join(c for c in name if c.isdigit())
+
+
+def compare_names_by_digits(name_a, name_b):
+    """
+    Compare nama berdasarkan digit sequence
+    Cek apakah ada 4-digit sequence yang sama atau angka panjang yang cocok
+    """
+    digits_a = extract_digits(name_a)
+    digits_b = extract_digits(name_b)
+    
+    if not digits_a or not digits_b:
+        return "Tidak Ada Digit"
+    
+    # Cek 4-digit sequence
+    if len(digits_a) >= 4 and len(digits_b) >= 4:
+        # Ambil 4 digit terakhir
+        last4_a = digits_a[-4:]
+        last4_b = digits_b[-4:]
+        if last4_a == last4_b:
+            return "Sama"
+    
+    # Cek full digit match
+    if digits_a == digits_b:
+        return "Sama"
+    
+    # Cek apakah ada substring 4+ digit yang match
+    for i in range(len(digits_a) - 3):
+        substr_a = digits_a[i:i+4]
+        if substr_a in digits_b:
+            return "Sama"
+    
+    return "Berbeda"
 
 
 def group_by_coordinate(recs):
@@ -147,6 +179,15 @@ def build_grouped_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
             else:
                 row[f"Nama {label_b} - Titik {i+1}"] = ""
         row[f"Jumlah Sumur {label_b}"] = len(recs_at_b)
+        
+        # Kesamaan Nama (compare first names or all names)
+        if len(recs_at_a) > 0 and len(recs_at_b) > 0:
+            # Compare first name of each
+            name_a = recs_at_a[0]["name"]
+            name_b = recs_at_b[0]["name"]
+            row["Kesamaan Nama"] = compare_names_by_digits(name_a, name_b)
+        else:
+            row["Kesamaan Nama"] = "-"
         
         # Keterangan (no emoji)
         row["Keterangan"] = "Overlap" if is_overlap else "Tidak Overlap"
@@ -221,7 +262,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(size=9)
                 
-                # Color by keterangan
+                # Color by keterangan dan kesamaan nama
                 if "Keterangan" in df.columns and ci == len(df.columns):
                     val_str = str(value) if value else ""
                     if "Overlap" in val_str and "Tidak" not in val_str:
@@ -230,6 +271,16 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only,
                     else:
                         cell.fill = PatternFill("solid", fgColor=RED)
                         cell.font = Font(size=9, bold=True, color="9C0006")
+                elif "Kesamaan Nama" in df.columns and ci == df.columns.get_loc("Kesamaan Nama") + 1:
+                    val_str = str(value) if value else ""
+                    if val_str == "Sama":
+                        cell.fill = PatternFill("solid", fgColor=GREEN)
+                        cell.font = Font(size=9, bold=True, color="006100")
+                    elif val_str == "Berbeda":
+                        cell.fill = PatternFill("solid", fgColor=RED)
+                        cell.font = Font(size=9, bold=True, color="9C0006")
+                    else:
+                        cell.fill = PatternFill("solid", fgColor=row_bg)
                 else:
                     cell.fill = PatternFill("solid", fgColor=row_bg)
         
