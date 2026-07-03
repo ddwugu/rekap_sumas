@@ -243,7 +243,8 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
     if polygon_cols is None:
         polygon_cols = []
     
-    def write_grouped_sheet(ws, df, title, stats_x, stats_y, label_x, label_y, show_stats=True):
+    def write_grouped_sheet(ws, df, title, stats_x, stats_y, label_x, label_y, show_stats=True, 
+                           extra_stats=None):
         ws.merge_cells("A1:M1")
         tc = ws["A1"]
         tc.value = title
@@ -352,6 +353,26 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                 c3.font = Font(size=10)
                 
                 stat_row += 1
+            
+            # Extra stats (for overlap sheet)
+            if extra_stats:
+                for label, val in extra_stats:
+                    c1 = ws.cell(row=stat_row, column=1, value=label)
+                    c1.font = Font(bold=True, size=10)
+                    c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                    c1.border = border
+                    
+                    c2 = ws.cell(row=stat_row, column=2, value="")
+                    c2.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                    c2.border = border
+                    
+                    c3 = ws.cell(row=stat_row, column=3, value=val)
+                    c3.alignment = Alignment(horizontal="center")
+                    c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                    c3.border = border
+                    c3.font = Font(size=10)
+                    
+                    stat_row += 1
         
         ws.column_dimensions["A"].width = 15
         ws.column_dimensions["B"].width = 15
@@ -367,8 +388,28 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
     # Sheet 2: Overlap
     if len(df_overlap) > 0:
         ws_ov = wb.create_sheet("Overlap")
+        
+        # Calculate extra stats for overlap
+        extra_stats_overlap = []
+        extra_stats_overlap.append(("Jumlah Titik Overlap", len(df_overlap)))
+        
+        # Count kesamaan nama
+        if "Kesamaan Nama" in df_overlap.columns:
+            nama_sama = len(df_overlap[df_overlap["Kesamaan Nama"] == "Sama"])
+            nama_berbeda = len(df_overlap[df_overlap["Kesamaan Nama"] == "Berbeda"])
+            extra_stats_overlap.append(("Memiliki Nama Sama", nama_sama))
+            extra_stats_overlap.append(("Memiliki Nama Berbeda", nama_berbeda))
+        
+        # Count analisa spasial status
+        if "Status Analisa Spasial" in df_overlap.columns:
+            lolos = len(df_overlap[df_overlap["Status Analisa Spasial"] == "Lolos"])
+            tidak_lolos = len(df_overlap[df_overlap["Status Analisa Spasial"] == "Tidak Lolos"])
+            extra_stats_overlap.append(("Lolos Analisa Spasial", lolos))
+            extra_stats_overlap.append(("Tidak Lolos Analisa Spasial", tidak_lolos))
+        
         write_grouped_sheet(ws_ov, df_overlap, f"OVERLAP: {label_a} × {label_b}",
-                           stats_a, stats_b, label_a, label_b, show_stats=True)
+                           stats_a, stats_b, label_a, label_b, show_stats=True,
+                           extra_stats=extra_stats_overlap)
     
     # Sheet 3: Hanya File A
     if len(df_file_a_only) > 0:
@@ -385,8 +426,21 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
     # Sheet 5: Lolos Analisa Spasial (jika polygon classifier aktif)
     if df_lolos_spasial is not None and len(df_lolos_spasial) > 0:
         ws_lolos = wb.create_sheet("Lolos Analisa Spasial")
+        
+        # Calculate extra stats for lolos spasial
+        extra_stats_lolos = []
+        extra_stats_lolos.append(("Jumlah Titik Lolos Analisa Spasial", len(df_lolos_spasial)))
+        
+        # Count kesamaan nama
+        if "Kesamaan Nama" in df_lolos_spasial.columns:
+            nama_sama = len(df_lolos_spasial[df_lolos_spasial["Kesamaan Nama"] == "Sama"])
+            nama_berbeda = len(df_lolos_spasial[df_lolos_spasial["Kesamaan Nama"] == "Berbeda"])
+            extra_stats_lolos.append(("Memiliki Nama Sama", nama_sama))
+            extra_stats_lolos.append(("Memiliki Nama Berbeda", nama_berbeda))
+        
         write_grouped_sheet(ws_lolos, df_lolos_spasial, "LOLOS ANALISA SPASIAL",
-                           stats_a, stats_b, label_a, label_b, show_stats=False)
+                           stats_a, stats_b, label_a, label_b, show_stats=False,
+                           extra_stats=extra_stats_lolos)
     
     buf = io.BytesIO()
     wb.save(buf)
