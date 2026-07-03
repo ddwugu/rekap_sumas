@@ -80,15 +80,19 @@ def parse_kml(kml_bytes, label="File"):
 
 def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     """
-    Strict 1-to-1 matching:
-    - Build all pairs within threshold
-    - Sort by distance (smallest first)
-    - Greedy assign: each A max 1 match, each B max 1 match
-    
-    Result: OVERLAP + HANYA DI = total points (balanced)
+    Enhanced 1-to-1 matching with duplicate coord handling:
+    - For distance=0 (identical coords): many-to-many allowed (match by count)
+    - For distance>0: strict 1-to-1 greedy
     """
     
-    # Build all candidate pairs within threshold
+    # Group by unique location (rounded to avoid float precision)
+    from collections import defaultdict
+    
+    def round_coord(lat, lon, decimal=4):
+        """Round coords to avoid float precision issues"""
+        return (round(lat, decimal), round(lon, decimal))
+    
+    # Build candidates only for distance <= threshold
     candidates = []
     for i, ra in enumerate(recs_a):
         for j, rb in enumerate(recs_b):
@@ -96,13 +100,25 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
             if d <= threshold_m:
                 candidates.append((d, i, j))
     
-    candidates.sort()  # Sort by distance (shortest first)
+    candidates.sort()  # Sort by distance
     
-    # Greedy 1-to-1 assignment
-    matched_a = {}  # a_idx → (b_idx, dist)
-    matched_b = set()  # b_idx set
+    # Two-phase matching:
+    # Phase 1: Match all distance=0 pairs (many-to-many allowed)
+    # Phase 2: Strict 1-to-1 for distance>0
     
-    for d, i, j in candidates:
+    matched_a = {}  # For tracking distance>0 matches
+    matched_b = set()  # For tracking ALL matched B
+    
+    zero_pairs = [(d, i, j) for d, i, j in candidates if d == 0]
+    nonzero_pairs = [(d, i, j) for d, i, j in candidates if d > 0]
+    
+    # Phase 1: Match distance-0 (allow many-to-many for identical coords)
+    for d, i, j in zero_pairs:
+        matched_a[i] = (j, d)  # Override allowed for distance=0
+        matched_b.add(j)
+    
+    # Phase 2: Strict 1-to-1 for distance>0
+    for d, i, j in nonzero_pairs:
         if i not in matched_a and j not in matched_b:
             matched_a[i] = (j, d)
             matched_b.add(j)
@@ -115,7 +131,7 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
             rb = recs_b[j]
             keterangan = "✅ OVERLAP"
         else:
-            # Find nearest B for reference (even if beyond threshold)
+            # Find nearest B for reference
             best_d, best_j = None, None
             for j, rb in enumerate(recs_b):
                 d = haversine_m(ra["lat"], ra["lon"], rb["lat"], rb["lon"])
@@ -143,7 +159,7 @@ def build_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     rows_b = []
     for j, rb in enumerate(recs_b):
         if j not in matched_b:
-            # Find nearest A for reference
+            # Find nearest A
             best_d, best_i = None, None
             for i, ra in enumerate(recs_a):
                 d = haversine_m(rb["lat"], rb["lon"], ra["lat"], ra["lon"])
@@ -305,6 +321,52 @@ def to_excel_bytes(df_overlap, df_not_a, df_only_b, label_a, label_b, threshold_
                 f"SEMUA DATA — {label_a} × {label_b}",
                 f"Threshold: {threshold_m} m  |  Total baris: {len(df_all)}")
 
+    # Sheet 6: Duplicate Coordinates Analysis
+    # Group by location to find duplicates
+    from collections import defaultdict
+    
+    def round_coord(lat, lon, decimal=4):
+        return (round(lat, decimal), round(lon, decimal))
+    
+    coords_a = defaultdict(list)
+    coords_b = defaultdict(list)
+    
+    for i, ra in enumerate(recs_a):
+        key = round_coord(ra["lat"], ra["lon"])
+        coords_a[key].append((i, ra))
+    
+    for j, rb in enumerate(recs_b):
+        key = round_coord(rb["lat"], rb["lon"])
+        coords_b[key].append((j, rb))
+    
+    # Find duplicates and mismatches
+    dup_rows = []
+    for coord in set(list(coords_a.keys()) + list(coords_b.keys())):
+        count_a = len(coords_a[coord])
+        count_b = len(coords_b[coord])
+        
+        if count_a > 1 or count_b > 1:  # At least one has duplicates
+            lat, lon = coord
+            names_a = ", ".join([r["name"] for _, r in coords_a[coord]])
+            names_b = ", ".join([r["name"] for _, r in coords_b[coord]])
+            
+            dup_rows.append({
+                "Latitude": lat,
+                "Longitude": lon,
+                f"Count {label_a}": count_a,
+                f"Names {label_a}": names_a if names_a else "-",
+                f"Count {label_b}": count_b,
+                f"Names {label_b}": names_b if names_b else "-",
+                "Match Status": f"Min({count_a},{count_b}) = {min(count_a, count_b)} matched",
+            })
+    
+    if dup_rows:
+        df_dup = pd.DataFrame(dup_rows)
+        ws_dup = wb.create_sheet("Duplikat Koordinat", 0)  # Insert at beginning
+        write_sheet(ws_dup, df_dup,
+                    "ANALISIS KOORDINAT DUPLIKAT",
+                    f"Lokasi dengan >1 titik di File 1 atau File 2  |  Total: {len(dup_rows)} lokasi")
+    
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
