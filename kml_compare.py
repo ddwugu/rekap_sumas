@@ -30,6 +30,11 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * asin(sqrt(a))
 
 
+def round_coord(lat, lon, decimal=4):
+    """Round coords for grouping"""
+    return (round(lat, decimal), round(lon, decimal))
+
+
 def extract_kml_bytes(uploaded_file):
     name = uploaded_file.name.lower()
     raw = uploaded_file.read()
