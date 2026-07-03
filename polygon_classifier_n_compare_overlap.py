@@ -270,7 +270,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.font = Font(size=9)
                 
-                # Color by keterangan dan polygon status
+                # Color by keterangan, polygon status, dan analisa spasial
                 col_name = df.columns[ci - 1]
                 if col_name == "Keterangan":
                     val_str = str(value) if value else ""
@@ -280,6 +280,16 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                     else:
                         cell.fill = PatternFill("solid", fgColor=RED)
                         cell.font = Font(size=9, bold=True, color="9C0006")
+                elif col_name == "Status Analisa Spasial":
+                    val_str = str(value) if value else ""
+                    if val_str == "Lolos":
+                        cell.fill = PatternFill("solid", fgColor=GREEN)
+                        cell.font = Font(size=9, bold=True, color="006100")
+                    elif val_str == "Tidak Lolos":
+                        cell.fill = PatternFill("solid", fgColor=RED)
+                        cell.font = Font(size=9, bold=True, color="9C0006")
+                    else:
+                        cell.fill = PatternFill("solid", fgColor=row_bg)
                 elif col_name in polygon_cols:
                     val_str = str(value) if value else ""
                     if val_str == "Lolos":
@@ -505,6 +515,8 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                 
                 # Build lolos spasial based on rules
                 df_lolos_spasial = df_overlap.copy()
+                lolos_pass_all = True
+                
                 for col_name, rule in polygon_rules.items():
                     if rule == "Lolos jika Dalam":
                         df_lolos_spasial = df_lolos_spasial[df_lolos_spasial[col_name] == 'Dalam']
@@ -512,6 +524,20 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                         df_lolos_spasial = df_lolos_spasial[df_lolos_spasial[col_name] == 'Luar']
                 
                 df_lolos_spasial = df_lolos_spasial.reset_index(drop=True)
+                
+                # Add Status Analisa Spasial column to all sheets
+                def check_lolos_spasial(row):
+                    for col_name, rule in polygon_rules.items():
+                        if col_name in row.index:
+                            status = row[col_name]
+                            if rule == "Lolos jika Dalam" and status != 'Dalam':
+                                return "Tidak Lolos"
+                            elif rule == "Lolos jika Luar" and status != 'Luar':
+                                return "Tidak Lolos"
+                    return "Lolos"
+                
+                for df in [df_all, df_overlap, df_file_a_only, df_file_b_only]:
+                    df["Status Analisa Spasial"] = df.apply(check_lolos_spasial, axis=1)
             
             # Metrics
             m1, m2, m3, m4 = st.columns(4)
