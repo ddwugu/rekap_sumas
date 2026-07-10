@@ -33,7 +33,7 @@ html, body, .stApp { background-color: var(--bg) !important; color: var(--text) 
 .stButton > button { background: linear-gradient(135deg, var(--accent), #00a86b) !important; color:#000 !important; font-weight:700 !important; border:none !important; border-radius:8px !important; width:100%; }
 .stDownloadButton > button { background: var(--surface2) !important; color: var(--text) !important; border:1px solid var(--border) !important; border-radius:8px !important; width:100%; }
 .poly-slot { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; margin-bottom: 0.75rem; }
-.stat-grid { display:grid; grid-template-columns: repeat(3,1fr); gap:1rem; margin: 1rem 0; }
+.stat-grid { display:grid; grid-template-columns: repeat(4,1fr); gap:1rem; margin: 1rem 0; }
 .stat-box { background: var(--surface); border:1px solid var(--border); border-radius:10px; padding:1rem; text-align:center; }
 .stat-num { font-size:2rem; font-weight:700; }
 .stat-label { font-size:0.75rem; color:var(--muted); text-transform:uppercase; }
@@ -149,12 +149,14 @@ def build_kmz_bytes(df, doc_name, icon_color='ff00d084'):
     return buf.getvalue()
 
 
-def build_excel_bytes(df_full, df_filtered, polygon_cols, filter_summary):
+def build_excel_bytes(df_full, df_filtered, df_rejected, polygon_cols, filter_summary):
     """
-    df_full     : semua titik + kolom status per polygon
-    df_filtered : hasil akhir setelah filter rule diterapkan
+    df_full     : semua titik + kolom status per polygon (Sheet 1)
+    df_filtered : titik yang LOLOS semua rule filter (Sheet 2)
+    df_rejected : titik yang TIDAK LOLOS filter (Sheet 3)
+                  -> df_filtered + df_rejected = df_full
     polygon_cols: list nama kolom status polygon, misal ['Polygon 1 (WK_A)', 'Polygon 2 (WK_B)']
-    filter_summary: list string ringkasan rule yg dipakai
+    filter_summary: list string ringkasan rule yg dipakai (Sheet 4)
     """
     wb = Workbook()
 
@@ -164,7 +166,10 @@ def build_excel_bytes(df_full, df_filtered, polygon_cols, filter_summary):
     GRN2 = PatternFill('solid', start_color='27AE60')
     BLU  = PatternFill('solid', start_color='2471A3')
     BLU2 = PatternFill('solid', start_color='2E86C1')
+    RED  = PatternFill('solid', start_color='922B21')
+    RED2 = PatternFill('solid', start_color='C0392B')
     ALT  = PatternFill('solid', start_color='EAF2F8')
+    ALTR = PatternFill('solid', start_color='FDEDEC')
     WHT  = PatternFill('solid', start_color='FFFFFF')
 
     def thin(c='30363D'):
@@ -225,7 +230,7 @@ def build_excel_bytes(df_full, df_filtered, polygon_cols, filter_summary):
             ws.cell(row=row, column=col).border = thin(bc)
         ws.row_dimensions[row].height = 18
 
-    # Sheet 1: Rekap Lengkap (semua titik vs semua polygon)
+    # ── Sheet 1: Rekap Lengkap (semua titik vs semua polygon) ──
     ws1 = wb.active
     ws1.title = 'Rekap Klasifikasi'
     write_title(ws1, 1, f'REKAP KLASIFIKASI TITIK vs {len(polygon_cols)} POLYGON', HDR, size=13)
@@ -237,9 +242,9 @@ def build_excel_bytes(df_full, df_filtered, polygon_cols, filter_summary):
     set_widths(ws1)
     ws1.auto_filter.ref = f'A3:{get_column_letter(ncols)}{next_row-1}'
 
-    # Sheet 2: Hasil Filter Final
+    # ── Sheet 2: Hasil Filter Final (LOLOS) ──
     ws2 = wb.create_sheet('Hasil Filter Final')
-    write_title(ws2, 1, 'HASIL AKHIR SETELAH FILTER', BLU, size=13)
+    write_title(ws2, 1, 'HASIL AKHIR SETELAH FILTER (LOLOS)', BLU, size=13)
     write_title(ws2, 2, f'Total titik lolos filter: {len(df_filtered):,} dari {len(df_full):,}', HDR2, size=10, height=18)
     write_headers(ws2, 3, BLU2, '2E86C1')
     next_row2 = write_rows(ws2, df_filtered, 4, ALT, 'AED6F1')
@@ -249,23 +254,59 @@ def build_excel_bytes(df_full, df_filtered, polygon_cols, filter_summary):
     if len(df_filtered) > 0:
         ws2.auto_filter.ref = f'A3:{get_column_letter(ncols)}{next_row2-1}'
 
-    # Sheet 3: Summary Rule Filter
-    ws3 = wb.create_sheet('Summary Filter')
-    ws3.column_dimensions['A'].width = 45
-    ws3.column_dimensions['B'].width = 30
-    write_title(ws3, 1, 'RINGKASAN RULE FILTER YANG DIPAKAI', HDR, size=12)
+    # ── Sheet 3: Tidak Lolos Filter ──
+    ws3 = wb.create_sheet('Tidak Lolos Filter')
+    write_title(ws3, 1, 'TITIK TIDAK LOLOS FILTER', RED, size=13)
+    write_title(ws3, 2,
+                f'Total tidak lolos: {len(df_rejected):,} dari {len(df_full):,} '
+                f'(Lolos {len(df_filtered):,} + Tidak Lolos {len(df_rejected):,} = {len(df_full):,})',
+                HDR2, size=10, height=18)
+    write_headers(ws3, 3, RED2, 'C0392B')
+    next_row3 = write_rows(ws3, df_rejected, 4, ALTR, 'F5B7B1')
+    write_total(ws3, next_row3, f'TOTAL TIDAK LOLOS: {len(df_rejected):,} TITIK', RED)
+    ws3.freeze_panes = 'A4'
+    set_widths(ws3)
+    if len(df_rejected) > 0:
+        ws3.auto_filter.ref = f'A3:{get_column_letter(ncols)}{next_row3-1}'
+
+    # ── Sheet 4: Summary Rule Filter ──
+    ws4 = wb.create_sheet('Summary Filter')
+    ws4.column_dimensions['A'].width = 45
+    ws4.column_dimensions['B'].width = 30
+    ws4.merge_cells('A1:B1')
+    c = ws4.cell(row=1, column=1, value='RINGKASAN RULE FILTER YANG DIPAKAI')
+    c.font = Font(bold=True, color='FFFFFF', size=12)
+    c.fill = HDR
+    c.alignment = Alignment(horizontal='center', vertical='center')
+    ws4.row_dimensions[1].height = 26
     r = 2
     if not filter_summary:
-        ws3.cell(row=r, column=1, value='Tidak ada rule filter aktif (semua polygon hanya info).')
-        ws3.cell(row=r, column=1).font = Font(italic=True, size=10)
+        ws4.cell(row=r, column=1, value='Tidak ada rule filter aktif (semua polygon hanya info).')
+        ws4.cell(row=r, column=1).font = Font(italic=True, size=10)
+        r += 1
     else:
         for line in filter_summary:
-            c = ws3.cell(row=r, column=1, value=line)
+            c = ws4.cell(row=r, column=1, value=line)
             c.font = Font(size=10)
             c.fill = ALT if r % 2 == 0 else WHT
             c.border = thin()
-            ws3.merge_cells(f'A{r}:B{r}')
+            ws4.merge_cells(f'A{r}:B{r}')
             r += 1
+
+    # Rekap angka kontrol: lolos + tidak lolos = total
+    r += 1
+    for label, val in [('Total titik (Rekap Klasifikasi)', len(df_full)),
+                       ('Lolos filter (Hasil Filter Final)', len(df_filtered)),
+                       ('Tidak lolos filter', len(df_rejected)),
+                       ('Kontrol: Lolos + Tidak Lolos', len(df_filtered) + len(df_rejected))]:
+        ca = ws4.cell(row=r, column=1, value=label)
+        cb = ws4.cell(row=r, column=2, value=val)
+        ca.font = Font(size=10, bold=True)
+        cb.font = Font(size=10, bold=True)
+        ca.border = thin()
+        cb.border = thin()
+        cb.alignment = Alignment(horizontal='center')
+        r += 1
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -340,7 +381,7 @@ with col_right:
 
                 active_slots = [s for s in polygon_slots if s['file'] is not None]
                 polygon_cols = []
-                rule_map = {}  # col_name -> ('dalam'|'luar')
+                rule_map = {}  # col_name -> ('Dalam'|'Luar')
                 filter_summary = []
 
                 for slot in active_slots:
@@ -370,14 +411,18 @@ with col_right:
                     st.stop()
 
                 # Terapkan filter rule (AND di semua polygon yang punya rule aktif)
-                df_filtered = df_pts.copy()
+                # Pakai mask supaya dapat LOLOS & TIDAK LOLOS sekaligus
+                mask = pd.Series(True, index=df_pts.index)
                 for col_name, required_status in rule_map.items():
-                    df_filtered = df_filtered[df_filtered[col_name] == required_status]
-                df_filtered = df_filtered.reset_index(drop=True)
+                    mask &= (df_pts[col_name] == required_status)
+
+                df_filtered = df_pts[mask].reset_index(drop=True)
+                df_rejected = df_pts[~mask].reset_index(drop=True)
 
                 st.session_state.update({
                     'df_pts': df_pts,
                     'df_filtered': df_filtered,
+                    'df_rejected': df_rejected,
                     'polygon_cols': polygon_cols,
                     'filter_summary': filter_summary,
                     'done': True,
@@ -392,17 +437,20 @@ with col_right:
     if st.session_state.get('done'):
         df_pts = st.session_state['df_pts']
         df_filtered = st.session_state['df_filtered']
+        df_rejected = st.session_state['df_rejected']
         polygon_cols = st.session_state['polygon_cols']
         filter_summary = st.session_state['filter_summary']
 
         n_total = len(df_pts)
         n_filtered = len(df_filtered)
+        n_rejected = len(df_rejected)
 
         st.markdown(f"""
         <div class="stat-grid">
             <div class="stat-box"><div class="stat-num">{n_total:,}</div><div class="stat-label">Total Titik</div></div>
             <div class="stat-box"><div class="stat-num">{len(polygon_cols)}</div><div class="stat-label">Polygon Diproses</div></div>
-            <div class="stat-box"><div class="stat-num">{n_filtered:,}</div><div class="stat-label">Lolos Filter</div></div>
+            <div class="stat-box"><div class="stat-num" style="color:var(--accent);">{n_filtered:,}</div><div class="stat-label">Lolos Filter</div></div>
+            <div class="stat-box"><div class="stat-num" style="color:var(--accent2);">{n_rejected:,}</div><div class="stat-label">Tidak Lolos</div></div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -411,7 +459,11 @@ with col_right:
         else:
             st.info("Tidak ada rule filter aktif — semua polygon hanya untuk info, hasil filter = semua titik.")
 
-        tab1, tab2 = st.tabs([f"📊 Rekap Semua Titik ({n_total:,})", f"✅ Hasil Filter Final ({n_filtered:,})"])
+        tab1, tab2, tab3 = st.tabs([
+            f"📊 Rekap Semua Titik ({n_total:,})",
+            f"✅ Hasil Filter Final ({n_filtered:,})",
+            f"❌ Tidak Lolos Filter ({n_rejected:,})",
+        ])
 
         show_cols = ['nama', 'lon', 'lat'] + polygon_cols
         rename_map = {'nama': 'Nama Titik', 'lon': 'Longitude', 'lat': 'Latitude'}
@@ -425,12 +477,18 @@ with col_right:
             else:
                 st.warning("Tidak ada titik yang lolos semua rule filter.")
 
+        with tab3:
+            if n_rejected > 0:
+                st.dataframe(df_rejected[show_cols].rename(columns=rename_map), use_container_width=True, height=320)
+            else:
+                st.success("Semua titik lolos filter — tidak ada yang gagal.")
+
         st.markdown("---")
         st.markdown("**⬇️ Download Hasil**")
 
-        dl1, dl2, dl3 = st.columns(3)
+        dl1, dl2, dl3, dl4 = st.columns(4)
         with dl1:
-            excel_bytes = build_excel_bytes(df_pts, df_filtered, polygon_cols, filter_summary)
+            excel_bytes = build_excel_bytes(df_pts, df_filtered, df_rejected, polygon_cols, filter_summary)
             st.download_button("📊 Excel Rekap + Filter", data=excel_bytes,
                                 file_name="Rekap_Klasifikasi_Multi_Polygon.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -443,8 +501,15 @@ with col_right:
                                 use_container_width=True,
                                 disabled=(n_filtered == 0))
         with dl3:
+            st.download_button("🔴 KMZ Tidak Lolos Filter",
+                                data=build_kmz_bytes(df_rejected, "Tidak Lolos Filter", 'ff3555ff'),
+                                file_name="Tidak_Lolos_Filter.kmz",
+                                mime="application/vnd.google-earth.kmz",
+                                use_container_width=True,
+                                disabled=(n_rejected == 0))
+        with dl4:
             st.download_button("🗺️ KMZ Semua Titik (rekap)",
-                                data=build_kmz_bytes(df_pts, "Semua Titik", 'ff3555ff'),
+                                data=build_kmz_bytes(df_pts, "Semua Titik", 'ffd0d0d0'),
                                 file_name="Semua_Titik_Rekap.kmz",
                                 mime="application/vnd.google-earth.kmz",
                                 use_container_width=True)
