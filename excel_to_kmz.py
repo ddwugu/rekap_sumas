@@ -8,21 +8,16 @@ import re
 import math
 
 # ============================================================
-# KONVERSI FORMAT KOORDINAT (FIXED)
+# KONVERSI FORMAT KOORDINAT
 # ============================================================
 
 def dms_to_decimal(dms_string):
-    """Convert DMS string e.g. -1° 52' 5.97\" to decimal degree
-    FIXED: handle simbol derajat apapun (°, ˚, etc) dan multiple spaces"""
+    """Convert DMS string e.g. -1° 52' 5.97\" to decimal degree"""
     if pd.isna(dms_string) or dms_string == '':
         return None
     try:
-        # PENTING: ganti simbol derajat/menit/detik yang aneh jadi standar dulu
         s = str(dms_string).strip()
-        # Normalize simbol: ˚→°, ′→', ″→"
         s = s.replace('˚', '°').replace('′', "'").replace('″', '"')
-        
-        # Regex lebih robust: \s+ handle multiple spaces
         pattern = r'(-?\d+)\s*°?\s*(\d+)\s*\'?\s*([\d.]+)\s*"?'
         match = re.match(pattern, s)
         if match:
@@ -39,16 +34,12 @@ def dms_to_decimal(dms_string):
 
 
 def dm_to_decimal(dm_string):
-    """Convert DM string e.g. -1° 52.0995' to decimal degree
-    FIXED: handle simbol derajat apapun dan multiple spaces"""
+    """Convert DM string e.g. -1° 52.0995' to decimal degree"""
     if pd.isna(dm_string) or dm_string == '':
         return None
     try:
         s = str(dm_string).strip()
-        # Normalize simbol
         s = s.replace('˚', '°').replace('′', "'").replace('″', '"')
-        
-        # Format dengan simbol derajat dan menit: -1° 52.0995'
         pattern = r'(-?\d+)\s*°?\s*([\d.]+)\s*\'?'
         match = re.match(pattern, s)
         if match and ('°' in s or "'" in s):
@@ -58,14 +49,13 @@ def dm_to_decimal(dm_string):
             if degrees < 0:
                 decimal = -decimal
             return decimal
-        # Kalau cuma angka biasa, anggap sudah decimal degree
         return float(s)
     except:
         return None
 
 
 def utm_to_latlon(x, y, zone=48, hemisphere='S'):
-    """Konversi UTM ke Lat/Lon (approximate, zone 48 default - area Jambi/Sumatera)"""
+    """Konversi UTM ke Lat/Lon (zone 48 default - area Jambi/Sumatera)"""
     if pd.isna(x) or pd.isna(y):
         return None, None
     try:
@@ -109,78 +99,95 @@ def utm_to_latlon(x, y, zone=48, hemisphere='S'):
         return None, None
 
 
-def parse_coord_value(value):
+# ============================================================
+# PRESISI PENUH: helper raw string
+# ============================================================
+
+def clean_decimal_str(value):
     """
-    Parse satu nilai koordinat (string/angka) apapun formatnya (DMS/DM/DD/UTM-raw)
-    jadi angka float mentah + tipe yang terdeteksi.
-    FIXED: normalize simbol dulu sebelum regex
+    Kalau value adalah angka decimal polos (dari excel), kembalikan STRING aslinya
+    (dibersihkan trailing koma/spasi) tanpa konversi ulang → zero rounding.
+    Return None kalau bukan angka polos.
     """
     if pd.isna(value) or value == '':
-        return None, None
+        return None
+    s = str(value).strip().rstrip(',').strip()
+    if '..' in s or '.-' in s:
+        s = s.replace('.-', '.').replace('..', '.')
+    try:
+        float(s)
+        return s
+    except:
+        return None
+
+
+def fmt_coord(val, raw_str=None):
+    """
+    Format koordinat untuk output KML.
+    - Kalau raw_str tersedia & value-nya sama → pakai raw_str VERBATIM (presisi = excel).
+    - Kalau hasil konversi (DMS/DM/UTM) → tulis 10 desimal (~0.01 mm, lebih dari cukup).
+    """
+    if raw_str is not None:
+        try:
+            if float(raw_str) == val:
+                return raw_str
+        except:
+            pass
+    return f"{val:.10f}".rstrip('0').rstrip('.')
+
+
+def parse_coord_value(value):
+    """Parse satu nilai koordinat → (float, tipe, raw_str_kalau_decimal_polos)"""
+    if pd.isna(value) or value == '':
+        return None, None, None
 
     s = str(value).strip()
-    # Normalize simbol segera
     s = s.replace('˚', '°').replace('′', "'").replace('″', '"')
 
-    # Ada simbol derajat → pasti DMS atau DM, hasil akhir = degree (angle)
     if '°' in s:
         val = dms_to_decimal(s)
         if val is None:
             val = dm_to_decimal(s)
         if val is not None:
-            return val, 'angle'
-        return None, None
+            return val, 'angle', None  # hasil konversi, tidak ada raw pass-through
+        return None, None, None
 
-    # Angka polos
-    try:
-        s_clean = s.rstrip(',').strip()
-        if '..' in s_clean or '.-' in s_clean:
-            s_clean = s_clean.replace('.-', '.').replace('..', '.')
-        num = float(s_clean)
-    except:
-        return None, None
+    raw = clean_decimal_str(s)
+    if raw is None:
+        return None, None, None
+    num = float(raw)
 
-    # Magnitude kecil (<=180) → kemungkinan besar sudah decimal degree
     if abs(num) <= 180:
-        return num, 'angle'
+        return num, 'angle', raw
 
-    # Magnitude besar → kemungkinan UTM (easting/northing dalam meter)
-    return num, 'utm'
+    return num, 'utm', raw
 
 
 def classify_lat_lon(val_a, val_b):
-    """
-    Diberi 2 nilai degree (val_a, val_b) yang sudah pasti 'angle' (bukan UTM),
-    tentukan mana latitude (-90..90) dan mana longitude (bisa lebih besar).
-    Return (lat, lon) atau (None, None) kalau tidak bisa ditentukan.
-    """
+    """Tentukan mana lat (-90..90) dan mana lon. Return (lat, lon) atau (None, None)."""
     a_is_lat = abs(val_a) <= 90
     b_is_lat = abs(val_b) <= 90
 
-    # Kalau cuma satu yang valid sebagai lat (di luar range utk yang lain) → jelas
     if a_is_lat and not b_is_lat:
         return val_a, val_b
     if b_is_lat and not a_is_lat:
         return val_b, val_a
 
-    # Keduanya valid sebagai lat (misal sama2 di bawah 90) → pakai heuristik magnitude
-    # Konvensi umum Indonesia: longitude (95-141) > |latitude| (-11 to 6)
     if a_is_lat and b_is_lat:
+        # Konvensi Indonesia: longitude (95-141) > |latitude| (-11 to 6)
         if abs(val_a) >= abs(val_b):
-            return val_b, val_a   # yang magnitude lebih besar = longitude
+            return val_b, val_a
         else:
             return val_a, val_b
 
-    # Keduanya di luar range lat → tidak valid sama sekali
     return None, None
 
 
 # ============================================================
-# DETEKSI KOLOM & EKSTRAKSI KOORDINAT PER BARIS
+# DETEKSI KOLOM
 # ============================================================
 
 def find_column(df, candidates):
-    """Cari nama kolom yang cocok (case-insensitive) dari daftar kandidat"""
     cols_lower = {c.lower().strip(): c for c in df.columns}
     for cand in candidates:
         if cand.lower() in cols_lower:
@@ -189,12 +196,6 @@ def find_column(df, candidates):
 
 
 def detect_columns(df):
-    """
-    Deteksi kolom nama & koordinat.
-    Prioritas: cari nama kolom eksplisit dulu (Decimal Degree, DMS, DM, UTM, Sumber Info).
-    Kalau tidak ada satupun yang cocok, fallback ke POSISI kolom:
-      kolom ke-1 = nama, kolom ke-2 & ke-3 = koordinat (urutan X/Y bebas, auto-detect).
-    """
     name_col = find_column(df, [
         'Nama', 'Name', 'Sumber Info 1', 'Nama Titik', 'Nama Sumur', 'ID', 'Sumur'
     ])
@@ -229,14 +230,12 @@ def detect_columns(df):
     }
 
     if not has_explicit_coord:
-        # Fallback POSITIONAL: kolom ke-1 = nama, kolom ke-2 & ke-3 = koordinat
         all_cols = list(df.columns)
         if len(all_cols) >= 3:
             cols['name'] = cols['name'] or all_cols[0]
             cols['coord_col_a'] = all_cols[1]
             cols['coord_col_b'] = all_cols[2]
         elif len(all_cols) == 2:
-            # Tidak ada kolom nama terpisah, cuma 2 kolom koordinat
             cols['coord_col_a'] = all_cols[0]
             cols['coord_col_b'] = all_cols[1]
 
@@ -245,42 +244,30 @@ def detect_columns(df):
 
 def get_coordinates(row, cols, utm_zone=48, utm_hemisphere='S'):
     """
-    Ambil lon, lat dari satu baris, dengan prioritas:
-    1. Decimal Degree (kolom eksplisit)
-    2. DM (kolom eksplisit)
-    3. DMS (kolom eksplisit)
-    4. UTM (kolom eksplisit X(UTM)/Y(UTM))
-    5. Kolom generic X/Y → auto-detect format dari isi value
-    Mengembalikan (lon, lat, format_terpakai)
+    Return (lon, lat, fmt, lon_raw, lat_raw).
+    lon_raw/lat_raw = string ASLI dari excel kalau formatnya decimal polos → dipakai
+    verbatim di KML (presisi 100% sama excel). None kalau hasil konversi.
     """
     # 1. Decimal Degree eksplisit
     if cols['lon_dd'] and cols['lat_dd']:
-        lon_raw = row.get(cols['lon_dd'])
-        lat_raw = row.get(cols['lat_dd'])
-        try:
-            lon = float(str(lon_raw).strip().rstrip(','))
-            lat_str = str(lat_raw).strip().rstrip(',')
-            if '..' in lat_str or '.-' in lat_str:
-                lat_str = lat_str.replace('.-', '.').replace('..', '.')
-            lat = float(lat_str)
-            if pd.notna(lon) and pd.notna(lat):
-                return lon, lat, 'Decimal Degree'
-        except:
-            pass
+        lon_raw = clean_decimal_str(row.get(cols['lon_dd']))
+        lat_raw = clean_decimal_str(row.get(cols['lat_dd']))
+        if lon_raw is not None and lat_raw is not None:
+            return float(lon_raw), float(lat_raw), 'Decimal Degree', lon_raw, lat_raw
 
     # 2. DM eksplisit
     if cols['lon_dm'] and cols['lat_dm']:
         lon = dm_to_decimal(row.get(cols['lon_dm']))
         lat = dm_to_decimal(row.get(cols['lat_dm']))
         if lon is not None and lat is not None:
-            return lon, lat, 'DM'
+            return lon, lat, 'DM', None, None
 
     # 3. DMS eksplisit
     if cols['lon_dms'] and cols['lat_dms']:
         lon = dms_to_decimal(row.get(cols['lon_dms']))
         lat = dms_to_decimal(row.get(cols['lat_dms']))
         if lon is not None and lat is not None:
-            return lon, lat, 'DMS'
+            return lon, lat, 'DMS', None, None
 
     # 4. UTM eksplisit
     if cols['x_utm'] and cols['y_utm']:
@@ -289,42 +276,43 @@ def get_coordinates(row, cols, utm_zone=48, utm_hemisphere='S'):
         if pd.notna(x_val) and pd.notna(y_val):
             lon, lat = utm_to_latlon(x_val, y_val, zone=utm_zone, hemisphere=utm_hemisphere)
             if lon is not None and lat is not None:
-                return lon, lat, 'UTM'
+                return lon, lat, 'UTM', None, None
 
-    # 5. Mode POSITIONAL: kolom ke-2 & ke-3, urutan bebas, auto-detect format & auto-swap
+    # 5. Mode POSITIONAL: auto-detect + auto-swap, raw string ikut di-swap
     if cols.get('coord_col_a') and cols.get('coord_col_b'):
-        raw_a = row.get(cols['coord_col_a'])
-        raw_b = row.get(cols['coord_col_b'])
+        raw_val_a = row.get(cols['coord_col_a'])
+        raw_val_b = row.get(cols['coord_col_b'])
 
-        val_a, type_a = parse_coord_value(raw_a)
-        val_b, type_b = parse_coord_value(raw_b)
+        val_a, type_a, str_a = parse_coord_value(raw_val_a)
+        val_b, type_b, str_b = parse_coord_value(raw_val_b)
 
         if val_a is None or val_b is None:
-            return None, None, None
+            return None, None, None, None, None
 
-        # Kasus 1: keduanya sudah berupa angle (degree, dari DD/DMS/DM) → classify mana lat/lon
         if type_a == 'angle' and type_b == 'angle':
             lat, lon = classify_lat_lon(val_a, val_b)
             if lat is not None and lon is not None:
-                return lon, lat, 'Auto-detect (angle, auto-swap)'
-            return None, None, None
+                # Map raw string mengikuti hasil swap
+                if lat == val_a:
+                    lat_raw, lon_raw = str_a, str_b
+                else:
+                    lat_raw, lon_raw = str_b, str_a
+                return lon, lat, 'Auto-detect (angle, auto-swap)', lon_raw, lat_raw
+            return None, None, None, None, None
 
-        # Kasus 2: keduanya UTM raw (meter) → easting selalu lebih kecil dari northing (di Indonesia selatan)
         if type_a == 'utm' and type_b == 'utm':
-            # Easting UTM Indonesia: ~100,000-900,000 | Northing (selatan, +10jt offset): ~9,000,000-10,000,000
             if val_a > val_b:
                 easting, northing = val_b, val_a
             else:
                 easting, northing = val_a, val_b
             lon, lat = utm_to_latlon(easting, northing, zone=utm_zone, hemisphere=utm_hemisphere)
             if lon is not None and lat is not None:
-                return lon, lat, 'UTM (auto-detect, auto-swap)'
-            return None, None, None
+                return lon, lat, 'UTM (auto-detect, auto-swap)', None, None
+            return None, None, None, None, None
 
-        # Kasus 3: campuran (jarang terjadi, data tidak konsisten) → gagal
-        return None, None, None
+        return None, None, None, None, None
 
-    return None, None, None
+    return None, None, None, None, None
 
 
 def get_point_name(row, cols, idx):
@@ -371,10 +359,13 @@ def create_kml_content(df, cols, title="Excel to KMZ", utm_zone=48, utm_hemisphe
     failed_count = 0
     failed_rows = []
     format_used_count = {}
+    precision_samples = []  # untuk panel verifikasi
 
     for idx, row in df.iterrows():
         try:
-            lon, lat, fmt = get_coordinates(row, cols, utm_zone=utm_zone, utm_hemisphere=utm_hemisphere)
+            lon, lat, fmt, lon_raw, lat_raw = get_coordinates(
+                row, cols, utm_zone=utm_zone, utm_hemisphere=utm_hemisphere
+            )
 
             if lon is None or lat is None:
                 failed_count += 1
@@ -382,6 +373,19 @@ def create_kml_content(df, cols, title="Excel to KMZ", utm_zone=48, utm_hemisphe
                 continue
 
             format_used_count[fmt] = format_used_count.get(fmt, 0) + 1
+
+            # PRESISI PENUH: pakai string asli excel kalau ada
+            lon_out = fmt_coord(lon, lon_raw)
+            lat_out = fmt_coord(lat, lat_raw)
+
+            if len(precision_samples) < 5:
+                precision_samples.append({
+                    'Baris': idx + 1,
+                    'Lon (excel/asli)': lon_raw if lon_raw else '(hasil konversi)',
+                    'Lat (excel/asli)': lat_raw if lat_raw else '(hasil konversi)',
+                    'Lon → KML': lon_out,
+                    'Lat → KML': lat_out,
+                })
 
             point_name = get_point_name(row, cols, idx)
 
@@ -393,8 +397,8 @@ def create_kml_content(df, cols, title="Excel to KMZ", utm_zone=48, utm_hemisphe
             desc_text = f"""
             <![CDATA[
             <b>Nama:</b> {point_name}<br/>
-            <b>Longitude:</b> {lon}<br/>
-            <b>Latitude:</b> {lat}<br/>
+            <b>Longitude:</b> {lon_out}<br/>
+            <b>Latitude:</b> {lat_out}<br/>
             <b>Format asal:</b> {fmt}
             ]]>
             """
@@ -405,7 +409,7 @@ def create_kml_content(df, cols, title="Excel to KMZ", utm_zone=48, utm_hemisphe
 
             point = ET.SubElement(placemark, 'Point')
             coordinates = ET.SubElement(point, 'coordinates')
-            coordinates.text = f"{lon},{lat},0"
+            coordinates.text = f"{lon_out},{lat_out},0"
 
             success_count += 1
 
@@ -418,7 +422,7 @@ def create_kml_content(df, cols, title="Excel to KMZ", utm_zone=48, utm_hemisphe
     dom = minidom.parseString(xml_str)
     pretty_xml = dom.toprettyxml(indent="  ", encoding='utf-8')
 
-    return pretty_xml, success_count, failed_count, failed_rows, format_used_count
+    return pretty_xml, success_count, failed_count, failed_rows, format_used_count, precision_samples
 
 
 def create_kmz(kml_content):
@@ -435,14 +439,13 @@ def create_kmz(kml_content):
 
 def main():
     st.set_page_config(
-        page_title="Excel to KMZ - Multi Format",
+        page_title="Excel to KMZ - Full Precision",
         page_icon="🗺️",
         layout="wide"
     )
 
-    st.title("🗺️ Excel to KMZ - Multi Format Auto-Detect (FIXED)")
-    st.markdown("**Mendukung: Decimal Degree, DMS, DM, UTM — kolom dan format auto-detect**")
-    st.info("✅ FIXED: Sekarang support simbol derajat apapun (°, ˚) dan spacing irregular")
+    st.title("🗺️ Excel to KMZ - Multi Format (Full Precision)")
+    st.markdown("**Decimal Degree, DMS, DM, UTM — auto-detect. Digit koordinat 100% sama dengan excel (raw pass-through).**")
 
     uploaded_file = st.file_uploader(
         "Upload Excel file",
@@ -455,8 +458,9 @@ def main():
 
             st.success(f"✅ File loaded. Total rows: {len(df)}")
 
-            st.subheader("📊 Data Preview")
-            st.dataframe(df.head(10), use_container_width=True)
+            st.subheader("📊 Data Preview (full digit, tanpa rounding tampilan)")
+            # Tampilkan sebagai string supaya tidak ada rounding display
+            st.dataframe(df.head(10).astype(str), use_container_width=True)
 
             cols = detect_columns(df)
 
@@ -475,7 +479,7 @@ def main():
             if cols.get('coord_col_a') and cols.get('coord_col_b'):
                 name_info = f" | Nama → `{cols['name']}`" if cols['name'] else " | (kolom nama tidak ada)"
                 detected.append(
-                    f"Mode posisi kolom (urutan X/Y bebas, auto-detect format) → "
+                    f"Mode posisi kolom (urutan X/Y bebas, auto-detect + auto-swap) → "
                     f"`{cols['coord_col_a']}` / `{cols['coord_col_b']}`{name_info}"
                 )
 
@@ -487,7 +491,6 @@ def main():
                 st.info(f"Kolom ditemukan di file: {', '.join(df.columns.tolist())}")
                 return
 
-            # Setting UTM (kalau dipakai)
             needs_utm = bool(cols['x_utm'] and cols['y_utm']) or bool(cols.get('coord_col_a') and cols.get('coord_col_b'))
             utm_zone, utm_hemisphere = 48, 'S'
             if needs_utm:
@@ -503,7 +506,7 @@ def main():
 
             if st.button("Convert to KMZ", type="primary", use_container_width=True):
                 with st.spinner("Converting..."):
-                    kml_content, success, failed, failed_rows, fmt_count = create_kml_content(
+                    kml_content, success, failed, failed_rows, fmt_count, prec_samples = create_kml_content(
                         df, cols, title=title, utm_zone=utm_zone, utm_hemisphere=utm_hemisphere
                     )
                     kmz_buffer = create_kmz(kml_content)
@@ -522,6 +525,11 @@ def main():
                         st.write("**Format koordinat terpakai:**")
                         for fmt, count in fmt_count.items():
                             st.write(f"- {fmt}: {count} titik")
+
+                    if prec_samples:
+                        st.subheader("🔬 Verifikasi Presisi (sample 5 baris pertama)")
+                        st.dataframe(pd.DataFrame(prec_samples), use_container_width=True)
+                        st.caption("Nilai 'Lon/Lat → KML' persis yang ditulis ke file KMZ. Kalau sumbernya decimal polos, string excel dipakai verbatim.")
 
                     if failed_rows:
                         with st.expander(f"⚠️ {len(failed_rows)} baris gagal — lihat detail"):
@@ -550,14 +558,12 @@ def main():
         | DM | `Longitude(DM)`, `Latitude(DM)` |
         | DMS | `Longitude(DMS)`, `Latitude(DMS)` |
         | UTM | `X(UTM)`, `Y(UTM)` |
-        | Generic | `X`, `Y` (format isi dideteksi otomatis per baris: DMS/DD/UTM) |
+        | Generic | `X`, `Y` (format isi dideteksi otomatis per baris) |
 
-        Kolom nama (opsional): `Nama`, `Name`, `Sumber Info 1`, `Sumber Info 2`, `Sumber Info 3`
-        
-        ### ✅ Improvements:
-        - Handle simbol derajat aneh (°, ˚) otomatis
-        - Handle spacing irregular di DMS format
-        - Detect kolom "Sumur" sebagai nama
+        ### ✅ Full Precision:
+        - Nilai decimal degree dari excel ditulis **verbatim** ke KML (string asli, bukan hasil re-format float)
+        - Hasil konversi DMS/DM/UTM ditulis 10 desimal (~0.01 mm)
+        - Preview & panel verifikasi presisi full digit
         """)
 
 if __name__ == "__main__":
