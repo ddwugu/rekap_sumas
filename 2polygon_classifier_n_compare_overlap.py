@@ -148,7 +148,7 @@ def extract_polygons_from_kml(kml_bytes):
     return polygons
 
 
-# ── CLUSTERING & MATCHING BERBASIS JARAK HAVERSINE (threshold user) ─────────
+# ── CLUSTERING & MATCHING ────────────────────────────────────────────────────
 
 def _grid_cell(lat, lon, cell_deg):
     return (int(lat // cell_deg), int(lon // cell_deg))
@@ -156,13 +156,26 @@ def _grid_cell(lat, lon, cell_deg):
 
 def cluster_points(recs, threshold_m):
     """
-    Kelompokkan titik dalam SATU file yang jaraknya ≤ threshold_m (haversine)
-    jadi satu 'lokasi'. Koordinat representatif = titik PERTAMA cluster,
-    disimpan lengkap dengan string aslinya (full precision).
-    Grid index dipakai supaya cepat untuk ribuan titik.
+    Kelompokkan titik duplikat dalam SATU file jadi satu 'lokasi'.
+
+    threshold_m = 0 (DEFAULT) → HANYA titik dengan koordinat IDENTIK PERSIS
+    (string sama) yang digabung. Sumur berbeda yang jaraknya dekat (mis. 3–4 m)
+    TETAP jadi lokasi terpisah, masing-masing dengan koordinat aslinya.
+
+    threshold_m > 0 → titik berjarak ≤ threshold digabung (haversine + grid index).
     """
+    if threshold_m <= 0:
+        groups = defaultdict(list)
+        for rec in recs:
+            groups[(rec["lat_str"], rec["lon_str"])].append(rec)
+        return [{
+            "lat": g[0]["lat"], "lon": g[0]["lon"],
+            "lat_str": g[0]["lat_str"], "lon_str": g[0]["lon_str"],
+            "recs": g,
+        } for g in groups.values()]
+
     cell_deg = max(threshold_m / 111320.0, 1e-9)
-    grid = defaultdict(list)   # cell -> list index cluster
+    grid = defaultdict(list)
     clusters = []
 
     for rec in recs:
@@ -195,9 +208,8 @@ def cluster_points(recs, threshold_m):
 
 def match_clusters(clusters_a, clusters_b, threshold_m):
     """
-    Greedy 1-to-1 matching antar cluster A dan B berdasarkan jarak haversine,
-    pair terdekat diprioritaskan. Overlap = jarak ≤ threshold_m.
-    Return: list (idx_a, idx_b, jarak_m), set matched_a, set matched_b
+    Greedy 1-to-1 matching antar lokasi A dan B berdasarkan jarak haversine,
+    pair TERDEKAT diprioritaskan. Overlap = jarak ≤ threshold_m.
     """
     cell_deg = max(threshold_m / 111320.0, 1e-9)
     grid_b = defaultdict(list)
@@ -237,28 +249,35 @@ def _cluster_stats(clusters, recs):
     }
 
 
-def build_grouped_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
+def build_grouped_comparison(recs_a, recs_b, threshold_m, dup_threshold_m, label_a, label_b):
     """
-    Overlap ditentukan JARAK HAVERSINE ≤ threshold_m (bukan pembulatan koordinat).
-    Koordinat output = string asli file KML (full precision, zero rounding).
+    - Duplikat intra-file: dup_threshold_m (default 0 = hanya koordinat identik persis).
+    - Overlap antar file: jarak haversine ≤ threshold_m.
+    - Koordinat A dan B DITAMPILKAN TERPISAH, string asli file (full precision).
     """
-    clusters_a = cluster_points(recs_a, threshold_m)
-    clusters_b = cluster_points(recs_b, threshold_m)
+    clusters_a = cluster_points(recs_a, dup_threshold_m)
+    clusters_b = cluster_points(recs_b, dup_threshold_m)
 
     matches, matched_a, matched_b = match_clusters(clusters_a, clusters_b, threshold_m)
 
     max_dup_a = max([len(c["recs"]) for c in clusters_a], default=1)
     max_dup_b = max([len(c["recs"]) for c in clusters_b], default=1)
 
+    col_lat_a = f"Latitude {label_a}"
+    col_lon_a = f"Longitude {label_a}"
+    col_lat_b = f"Latitude {label_b}"
+    col_lon_b = f"Longitude {label_b}"
+
     rows = []
 
     def make_row(ca, cb, dist_m):
-        # Koordinat: pakai representatif A kalau ada, kalau tidak pakai B — string asli
-        src = ca if ca is not None else cb
-        row = {
-            "Latitude": src["lat_str"],
-            "Longitude": src["lon_str"],
-        }
+        row = {}
+        # Koordinat A & B masing-masing, string asli file → jelas terlihat bedanya
+        row[col_lat_a] = ca["lat_str"] if ca is not None else ""
+        row[col_lon_a] = ca["lon_str"] if ca is not None else ""
+        row[col_lat_b] = cb["lat_str"] if cb is not None else ""
+        row[col_lon_b] = cb["lon_str"] if cb is not None else ""
+
         recs_at_a = ca["recs"] if ca is not None else []
         recs_at_b = cb["recs"] if cb is not None else []
 
@@ -277,7 +296,8 @@ def build_grouped_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
 
         row["Jarak (m)"] = round(dist_m, 2) if dist_m is not None else ""
         row["Keterangan"] = "Overlap" if (recs_at_a and recs_at_b) else "Tidak Overlap"
-        # simpan float utk polygon check & sorting
+
+        src = ca if ca is not None else cb
         row["_lat"] = src["lat"]
         row["_lon"] = src["lon"]
         return row
@@ -300,11 +320,14 @@ def build_grouped_comparison(recs_a, recs_b, threshold_m, label_a, label_b):
     stats_a = _cluster_stats(clusters_a, recs_a)
     stats_b = _cluster_stats(clusters_b, recs_b)
 
-    return df, max_dup_a, max_dup_b, stats_a, stats_b
+    coord_cols = [col_lat_a, col_lon_a, col_lat_b, col_lon_b]
+
+    return df, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols
 
 
 def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
-                        label_a, label_b, stats_a, stats_b, threshold_m, polygon_cols=None):
+                        label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
+                        coord_cols, polygon_cols=None):
     wb = Workbook()
 
     GREEN = "C6EFCE"
@@ -320,7 +343,6 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         polygon_cols = []
 
     def visible_df(df):
-        """Buang kolom internal (_lat/_lon) dari output"""
         return df[[c for c in df.columns if not c.startswith("_")]]
 
     def write_grouped_sheet(ws, df_raw, title, stats_x, stats_y, label_x, label_y,
@@ -347,14 +369,16 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
             for ci, value in enumerate(row, 1):
                 col_name = df.columns[ci - 1]
 
-                # Koordinat: tulis sebagai ANGKA full precision (tanpa round),
-                # format tampilan sampai 10 desimal
-                if col_name in ("Latitude", "Longitude"):
-                    try:
-                        cell = ws.cell(row=ri, column=ci, value=float(value))
-                        cell.number_format = '0.##########'
-                    except (ValueError, TypeError):
-                        cell = ws.cell(row=ri, column=ci, value=value)
+                # Koordinat: ANGKA full precision (tanpa round), tampil s.d. 10 desimal
+                if col_name in coord_cols:
+                    if value != "" and value is not None:
+                        try:
+                            cell = ws.cell(row=ri, column=ci, value=float(value))
+                            cell.number_format = '0.##########'
+                        except (ValueError, TypeError):
+                            cell = ws.cell(row=ri, column=ci, value=value)
+                    else:
+                        cell = ws.cell(row=ri, column=ci, value="")
                 else:
                     cell = ws.cell(row=ri, column=ci, value=value)
 
@@ -380,8 +404,6 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                         cell.font = Font(size=9, bold=True, color="9C0006")
                     else:
                         cell.fill = PatternFill("solid", fgColor=row_bg)
-                elif col_name in polygon_cols:
-                    cell.fill = PatternFill("solid", fgColor=row_bg)
                 else:
                     cell.fill = PatternFill("solid", fgColor=row_bg)
 
@@ -406,7 +428,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                 "Total Lokasi dg 2 Nama Sumur",
                 "Total Lokasi Single",
                 "Total Nama Sumur",
-                "Total Lokasi (cluster jarak ≤ threshold)",
+                "Total Lokasi Unik",
             ]
             stat_keys = ["dup_3", "dup_2", "dup_1", "total_nama", "total_koordinat"]
 
@@ -430,17 +452,19 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
 
                 stat_row += 1
 
-            # Info threshold yang dipakai
-            c1 = ws.cell(row=stat_row, column=1, value="Threshold Overlap (meter)")
-            c1.font = Font(bold=True, size=10)
-            c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-            c1.border = border
-            c3 = ws.cell(row=stat_row, column=3, value=threshold_m)
-            c3.alignment = Alignment(horizontal="center")
-            c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-            c3.border = border
-            c3.font = Font(size=10)
-            stat_row += 1
+            for label, val in [("Threshold Overlap antar file (meter)", threshold_m),
+                               ("Threshold Duplikat dalam file (meter)",
+                                dup_threshold_m if dup_threshold_m > 0 else "0 (identik persis)")]:
+                c1 = ws.cell(row=stat_row, column=1, value=label)
+                c1.font = Font(bold=True, size=10)
+                c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                c1.border = border
+                c3 = ws.cell(row=stat_row, column=3, value=val)
+                c3.alignment = Alignment(horizontal="center")
+                c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
+                c3.border = border
+                c3.font = Font(size=10)
+                stat_row += 1
 
             if extra_stats:
                 for label, val in extra_stats:
@@ -463,13 +487,16 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
 
         ws.column_dimensions["A"].width = 16
         ws.column_dimensions["B"].width = 16
-        for i in range(3, 30):
+        ws.column_dimensions["C"].width = 16
+        ws.column_dimensions["D"].width = 16
+        for i in range(5, 32):
             ws.column_dimensions[get_column_letter(i)].width = 16
 
     # Sheet 1: Semua Data
     ws_all = wb.active
     ws_all.title = "Semua Data"
-    write_grouped_sheet(ws_all, df_all, f"PERBANDINGAN: {label_a} × {label_b} (threshold {threshold_m} m)",
+    write_grouped_sheet(ws_all, df_all,
+                        f"PERBANDINGAN: {label_a} × {label_b} (overlap ≤ {threshold_m} m)",
                         stats_a, stats_b, label_a, label_b, show_stats=True)
 
     # Sheet 2: Overlap
@@ -482,7 +509,8 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         if "Status Analisa Spasial" in df_overlap.columns:
             extra_stats_overlap.append(("Lolos Analisa Spasial", len(df_overlap[df_overlap["Status Analisa Spasial"] == "Lolos"])))
             extra_stats_overlap.append(("Tidak Lolos Analisa Spasial", len(df_overlap[df_overlap["Status Analisa Spasial"] == "Tidak Lolos"])))
-        write_grouped_sheet(ws_ov, df_overlap, f"OVERLAP: {label_a} × {label_b} (threshold {threshold_m} m)",
+        write_grouped_sheet(ws_ov, df_overlap,
+                            f"OVERLAP: {label_a} × {label_b} (jarak ≤ {threshold_m} m)",
                             stats_a, stats_b, label_a, label_b, show_stats=True,
                             extra_stats=extra_stats_overlap)
 
@@ -518,17 +546,25 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 st.title("🗺️ KML/KMZ Compare + Polygon Classifier")
-st.caption("Upload 2 KML/KMZ → overlap berdasar jarak haversine ≤ threshold → optional polygon spatial analysis. Koordinat output full precision (string asli file).")
+st.caption("Overlap antar file = jarak haversine ≤ threshold. Koordinat A & B ditampilkan terpisah, full precision (string asli file). Duplikat intra-file default hanya koordinat identik persis.")
 
 with st.sidebar:
     st.header("⚙️ Pengaturan")
     threshold_m = st.number_input(
-        "Threshold jarak overlap (meter)",
+        "Threshold overlap ANTAR file (meter)",
         min_value=0.1, max_value=10_000.0, value=5.0, step=1.0,
-        help="Dua titik dianggap OVERLAP kalau jarak haversine antar titik ≤ nilai ini. "
-             "Titik dalam satu file yang berjarak ≤ threshold juga digabung jadi satu lokasi (duplikat)."
+        help="Titik File 1 dan File 2 dianggap OVERLAP kalau jarak haversine ≤ nilai ini."
     )
-    st.caption(f"⚙️ Overlap = jarak ≤ {threshold_m:g} m (haversine, bukan pembulatan koordinat)")
+    dup_threshold_m = st.number_input(
+        "Threshold duplikat DALAM satu file (meter)",
+        min_value=0.0, max_value=1_000.0, value=0.0, step=1.0,
+        help="0 (default) = hanya titik dengan koordinat IDENTIK PERSIS yang digabung "
+             "jadi satu lokasi. Sumur berbeda yang berdekatan (mis. 3-4 m) tetap "
+             "jadi baris terpisah dengan koordinat masing-masing. "
+             "Isi > 0 kalau memang mau gabungkan titik berdekatan dalam satu file."
+    )
+    st.caption(f"Overlap antar file: ≤ {threshold_m:g} m | Duplikat intra-file: "
+               f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
 
     st.markdown("---")
     use_polygon = st.checkbox("🗺️ Gunakan Polygon Classifier", value=False)
@@ -597,11 +633,12 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                 st.error("❌ Tidak ada titik yang terbaca.")
                 st.stop()
 
-            st.success(f"**{label_a}**: {len(recs_a)} titik | **{label_b}**: {len(recs_b)} titik | Threshold overlap: {threshold_m:g} m")
+            st.success(f"**{label_a}**: {len(recs_a)} titik | **{label_b}**: {len(recs_b)} titik | "
+                       f"Overlap ≤ {threshold_m:g} m | Duplikat intra-file: "
+                       f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
 
-            # Build comparison — overlap by haversine distance ≤ threshold
-            df_all, max_dup_a, max_dup_b, stats_a, stats_b = build_grouped_comparison(
-                recs_a, recs_b, threshold_m, label_a, label_b
+            df_all, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols = build_grouped_comparison(
+                recs_a, recs_b, threshold_m, dup_threshold_m, label_a, label_b
             )
 
             df_overlap = df_all[df_all["Keterangan"] == "Overlap"].reset_index(drop=True)
@@ -630,14 +667,12 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                     polygon_cols_list.append(col_name)
                     polygon_rules[col_name] = slot['rule']
 
-                    # covers (bukan contains) → titik persis di garis batas dihitung Dalam
                     for df in [df_all, df_overlap, df_file_a_only, df_file_b_only]:
                         df[col_name] = df.apply(
                             lambda r: 'Dalam' if union_poly.covers(Point(r['_lon'], r['_lat'])) else 'Luar',
                             axis=1
                         )
 
-                # Status Analisa Spasial di semua sheet
                 def check_lolos_spasial(row):
                     for col_name, rule in polygon_rules.items():
                         if col_name in row.index:
@@ -701,7 +736,8 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
 
             excel_bytes = build_excel_grouped(
                 df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
-                label_a, label_b, stats_a, stats_b, threshold_m, polygon_cols_list
+                label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
+                coord_cols, polygon_cols_list
             )
 
             fn = f"Compare_{label_a}_vs_{label_b}.xlsx".replace(" ", "_")
