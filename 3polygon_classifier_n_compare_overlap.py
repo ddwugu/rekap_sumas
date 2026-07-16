@@ -359,49 +359,82 @@ def build_per_row_comparison(recs_a, recs_b, clusters_a, clusters_b, matches,
         label_p, label_s = label_b, label_a
         match_map = {j: (i, d) for i, j, d in matches}
 
-    rec2cluster = _map_rec_to_cluster(clusters_p)
-    max_dup_s = max([len(c["recs"]) for c in clusters_s], default=1)
-
     col_lat_p = f"Latitude {label_p}"
     col_lon_p = f"Longitude {label_p}"
     col_lat_s = f"Latitude {label_s}"
     col_lon_s = f"Longitude {label_s}"
 
+    # Urutkan cluster berdasarkan kemunculan pertama di file (urutan asli),
+    # anggota redundant dalam 1 cluster ditulis BERURUTAN (dikelompokkan).
+    ordered_clusters = sorted(
+        range(len(clusters_p)),
+        key=lambda ci: min(r["order"] for r in clusters_p[ci]["recs"])
+    )
+
     rows = []
-    for no, rec in enumerate(recs_p, start=1):
-        row = {"No": no, f"Nama {label_p}": rec["name"],
-               col_lat_p: rec["lat_str"], col_lon_p: rec["lon_str"]}
+    no = 0
+    for grp_id, ci in enumerate(ordered_clusters, start=1):
+        cluster = clusters_p[ci]
+        member_recs = sorted(cluster["recs"], key=lambda r: r["order"])
+        is_redundant = len(member_recs) > 1
+        pair = match_map.get(ci)
 
-        ci = rec2cluster.get(id(rec))
-        pair = match_map.get(ci) if ci is not None else None
+        for rec in member_recs:
+            no += 1
+            row = {"No": no, f"Nama {label_p}": rec["name"],
+                   col_lat_p: rec["lat_str"], col_lon_p: rec["lon_str"],
+                   f"Jumlah Redundant {label_p}": len(member_recs)}
 
-        if pair is not None:
-            cs = clusters_s[pair[0]]
-            recs_s = cs["recs"]
-            for k in range(max_dup_s):
-                row[f"Nama {label_s} - Titik {k+1}"] = recs_s[k]["name"] if k < len(recs_s) else ""
-            row[f"Jumlah Sumur {label_s}"] = len(recs_s)
-            row[col_lat_s] = cs["lat_str"]
-            row[col_lon_s] = cs["lon_str"]
-            row["Kesamaan Nama"] = compare_names_by_digits(rec["name"], recs_s[0]["name"])
-            row["Jarak (m)"] = round(pair[1], 2)
-            row["Keterangan"] = "Overlap"
-        else:
-            for k in range(max_dup_s):
-                row[f"Nama {label_s} - Titik {k+1}"] = ""
-            row[f"Jumlah Sumur {label_s}"] = 0
-            row[col_lat_s] = ""
-            row[col_lon_s] = ""
-            row["Kesamaan Nama"] = "-"
-            row["Jarak (m)"] = ""
-            row["Keterangan"] = "Tidak Overlap"
+            if pair is not None:
+                cs = clusters_s[pair[0]]
+                names_s = [r["name"] for r in cs["recs"]]
+                row[f"Nama {label_s}"] = ", ".join(names_s)
+                row[f"Jumlah Sumur {label_s}"] = len(names_s)
+                row[col_lat_s] = cs["lat_str"]
+                row[col_lon_s] = cs["lon_str"]
+                row["Kesamaan Nama"] = compare_names_by_digits(rec["name"], names_s[0])
+                row["Jarak (m)"] = round(pair[1], 2)
+                row["Keterangan"] = "Overlap"
+            else:
+                row[f"Nama {label_s}"] = ""
+                row[f"Jumlah Sumur {label_s}"] = 0
+                row[col_lat_s] = ""
+                row[col_lon_s] = ""
+                row["Kesamaan Nama"] = "-"
+                row["Jarak (m)"] = ""
+                row["Keterangan"] = "Tidak Overlap"
 
-        row["_lat"] = rec["lat"]
-        row["_lon"] = rec["lon"]
-        rows.append(row)
+            row["_lat"] = rec["lat"]
+            row["_lon"] = rec["lon"]
+            row["_grup"] = grp_id
+            row["_redundant"] = is_redundant
+            rows.append(row)
 
     df = pd.DataFrame(rows)
     return df, label_p, label_s
+
+
+def per_row_fills(df_per_row):
+    """
+    Warna baris sheet Per Sumur: kelompok redundant diberi warna biru,
+    2 shade biru bergantian antar grup redundant yang bersebelahan
+    biar batas antar kelompok keliatan jelas.
+    """
+    BLUE_1 = "DDEBF7"
+    BLUE_2 = "B4C6E7"
+    fills = []
+    shade_toggle = 0
+    prev_grup = None
+    for _, r in df_per_row.iterrows():
+        if r["_redundant"]:
+            if r["_grup"] != prev_grup:
+                shade_toggle ^= 1
+            fills.append(BLUE_1 if shade_toggle else BLUE_2)
+            prev_grup = r["_grup"]
+        else:
+            fills.append(None)
+            prev_grup = None
+    return fills
 
 
 def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
@@ -426,7 +459,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         return df[[c for c in df.columns if not c.startswith("_")]]
 
     def write_grouped_sheet(ws, df_raw, title, stats_x, stats_y, label_x, label_y,
-                            show_stats=True, extra_stats=None):
+                            show_stats=True, extra_stats=None, row_fills=None):
         df = visible_df(df_raw)
         ws.merge_cells("A1:M1")
         tc = ws["A1"]
@@ -445,7 +478,8 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         ws.row_dimensions[2].height = 32
 
         for ri, row in enumerate(df.itertuples(index=False), start=3):
-            row_bg = LIGHT_GRAY if ri % 2 == 0 else WHITE
+            override = row_fills[ri - 3] if row_fills is not None else None
+            row_bg = override if override else (LIGHT_GRAY if ri % 2 == 0 else WHITE)
             for ci, value in enumerate(row, 1):
                 col_name = df.columns[ci - 1]
 
@@ -583,10 +617,12 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
     if df_per_row is not None and len(df_per_row) > 0:
         ws_pr = wb.create_sheet("Per Sumur")
         n_overlap_pr = len(df_per_row[df_per_row["Keterangan"] == "Overlap"])
+        n_redundant_pr = int(df_per_row["_redundant"].sum()) if "_redundant" in df_per_row.columns else 0
         extra_stats_pr = [
             ("Total Baris (nama sumur " + per_row_label_p + ")", len(df_per_row)),
             ("Baris Overlap", n_overlap_pr),
             ("Baris Tidak Overlap", len(df_per_row) - n_overlap_pr),
+            ("Baris Redundant (biru)", n_redundant_pr),
         ]
         if "Status Analisa Spasial" in df_per_row.columns:
             extra_stats_pr.append(("Lolos Analisa Spasial",
@@ -594,9 +630,11 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
             extra_stats_pr.append(("Tidak Lolos Analisa Spasial",
                                    len(df_per_row[df_per_row["Status Analisa Spasial"] == "Tidak Lolos"])))
         write_grouped_sheet(ws_pr, df_per_row,
-                            f"PER SUMUR: 1 baris = 1 nama sumur {per_row_label_p} (urutan asli file)",
+                            f"PER SUMUR: 1 baris = 1 nama sumur {per_row_label_p} "
+                            f"(redundant dikelompokkan berurutan, warna biru)",
                             stats_a, stats_b, label_a, label_b, show_stats=False,
-                            extra_stats=extra_stats_pr)
+                            extra_stats=extra_stats_pr,
+                            row_fills=per_row_fills(df_per_row))
 
     # Sheet 3: Overlap
     if len(df_overlap) > 0:
@@ -823,8 +861,9 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
             with tabs[0]:
                 st.dataframe(preview(df_all), use_container_width=True, height=400)
             with tabs[1]:
-                st.caption(f"1 baris = 1 nama sumur **{per_row_label_p}** (file terbanyak), "
-                           f"urutan asli file, dibandingkan dg lokasi match di **{per_row_label_s}**.")
+                st.caption(f"1 baris = 1 nama sumur **{per_row_label_p}** (file terbanyak). "
+                           f"Redundant (koordinat sama) dikelompokkan berurutan → di Excel diberi warna biru. "
+                           f"Nama {per_row_label_s} digabung pakai koma.")
                 st.dataframe(preview(df_per_row), use_container_width=True, height=400)
             with tabs[2]:
                 st.dataframe(preview(df_overlap), use_container_width=True, height=400)
