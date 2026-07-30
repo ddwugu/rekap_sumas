@@ -110,7 +110,8 @@ def parse_kml(kml_bytes, label="File"):
         except ValueError:
             continue
         records.append({"name": name, "lat": lat, "lon": lon,
-                        "lat_str": lat_str, "lon_str": lon_str})
+                        "lat_str": lat_str, "lon_str": lon_str,
+                        "order": len(records)})
     return records
 
 
@@ -322,10 +323,134 @@ def build_grouped_comparison(recs_a, recs_b, threshold_m, dup_threshold_m, label
 
     coord_cols = [col_lat_a, col_lon_a, col_lat_b, col_lon_b]
 
-    return df, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols
+    return (df, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols,
+            clusters_a, clusters_b, matches)
+
+
+# ── PER SUMUR (1 BARIS = 1 NAMA SUMUR, URUTAN ASLI FILE TERBANYAK) ───────────
+
+def _map_rec_to_cluster(clusters):
+    m = {}
+    for idx, c in enumerate(clusters):
+        for rec in c["recs"]:
+            m[id(rec)] = idx
+    return m
+
+
+def build_per_row_comparison(recs_a, recs_b, clusters_a, clusters_b, matches,
+                             label_a, label_b, primary="auto"):
+    """
+    Sheet 'Per Sumur':
+    - Baris mengikuti file ACUAN (primary). File acuan ditentukan `primary`:
+        "auto" → file dengan JUMLAH NAMA TERBANYAK (perilaku lama, default)
+        "a"    → selalu ikut File 1 (label_a)
+        "b"    → selalu ikut File 2 (label_b)
+    - Urutan baris = urutan ASLI file acuan.
+    - Setiap nama sumur = 1 baris, walau koordinatnya duplikat/redundant.
+      Contoh: x1 & x2 di koordinat sama → tetap 2 baris terpisah.
+    - Tiap baris dipasangkan dengan lokasi match di file satunya (secondary):
+      semua nama di lokasi itu (y1, y2, y3) tampil di kolom perbandingan,
+      lengkap koordinat, kesamaan nama, jarak, keterangan.
+    """
+    # Tentukan file acuan (primary) sesuai pilihan user
+    if primary == "a":
+        use_a = True
+    elif primary == "b":
+        use_a = False
+    else:  # "auto" → file terbanyak
+        use_a = len(recs_a) >= len(recs_b)
+
+    if use_a:
+        recs_p, clusters_p = recs_a, clusters_a
+        clusters_s = clusters_b
+        label_p, label_s = label_a, label_b
+        match_map = {i: (j, d) for i, j, d in matches}
+    else:
+        recs_p, clusters_p = recs_b, clusters_b
+        clusters_s = clusters_a
+        label_p, label_s = label_b, label_a
+        match_map = {j: (i, d) for i, j, d in matches}
+
+    col_lat_p = f"Latitude {label_p}"
+    col_lon_p = f"Longitude {label_p}"
+    col_lat_s = f"Latitude {label_s}"
+    col_lon_s = f"Longitude {label_s}"
+
+    # Urutkan cluster berdasarkan kemunculan pertama di file (urutan asli),
+    # anggota redundant dalam 1 cluster ditulis BERURUTAN (dikelompokkan).
+    ordered_clusters = sorted(
+        range(len(clusters_p)),
+        key=lambda ci: min(r["order"] for r in clusters_p[ci]["recs"])
+    )
+
+    rows = []
+    no = 0
+    for grp_id, ci in enumerate(ordered_clusters, start=1):
+        cluster = clusters_p[ci]
+        member_recs = sorted(cluster["recs"], key=lambda r: r["order"])
+        is_redundant = len(member_recs) > 1
+        pair = match_map.get(ci)
+
+        for rec in member_recs:
+            no += 1
+            row = {"No": no, f"Nama {label_p}": rec["name"],
+                   col_lat_p: rec["lat_str"], col_lon_p: rec["lon_str"],
+                   f"Jumlah Redundant {label_p}": len(member_recs)}
+
+            if pair is not None:
+                cs = clusters_s[pair[0]]
+                names_s = [r["name"] for r in cs["recs"]]
+                row[f"Nama {label_s}"] = ", ".join(names_s)
+                row[f"Jumlah Sumur {label_s}"] = len(names_s)
+                row[col_lat_s] = cs["lat_str"]
+                row[col_lon_s] = cs["lon_str"]
+                row["Kesamaan Nama"] = compare_names_by_digits(rec["name"], names_s[0])
+                row["Jarak (m)"] = round(pair[1], 2)
+                row["Keterangan"] = "Overlap"
+            else:
+                row[f"Nama {label_s}"] = ""
+                row[f"Jumlah Sumur {label_s}"] = 0
+                row[col_lat_s] = ""
+                row[col_lon_s] = ""
+                row["Kesamaan Nama"] = "-"
+                row["Jarak (m)"] = ""
+                row["Keterangan"] = "Tidak Overlap"
+
+            row["_lat"] = rec["lat"]
+            row["_lon"] = rec["lon"]
+            row["_grup"] = grp_id
+            row["_redundant"] = is_redundant
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    return df, label_p, label_s
+
+
+def per_row_fills(df_per_row):
+    """
+    Warna baris sheet Per Sumur: kelompok redundant diberi warna biru,
+    2 shade biru bergantian antar grup redundant yang bersebelahan
+    biar batas antar kelompok keliatan jelas.
+    """
+    BLUE_1 = "DDEBF7"
+    BLUE_2 = "B4C6E7"
+    fills = []
+    shade_toggle = 0
+    prev_grup = None
+    for _, r in df_per_row.iterrows():
+        if r["_redundant"]:
+            if r["_grup"] != prev_grup:
+                shade_toggle ^= 1
+            fills.append(BLUE_1 if shade_toggle else BLUE_2)
+            prev_grup = r["_grup"]
+        else:
+            fills.append(None)
+            prev_grup = None
+    return fills
 
 
 def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
+                        df_per_row, per_row_label_p,
                         label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
                         coord_cols, polygon_cols=None):
     wb = Workbook()
@@ -346,7 +471,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         return df[[c for c in df.columns if not c.startswith("_")]]
 
     def write_grouped_sheet(ws, df_raw, title, stats_x, stats_y, label_x, label_y,
-                            show_stats=True, extra_stats=None):
+                            show_stats=True, extra_stats=None, row_fills=None):
         df = visible_df(df_raw)
         ws.merge_cells("A1:M1")
         tc = ws["A1"]
@@ -365,7 +490,8 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
         ws.row_dimensions[2].height = 32
 
         for ri, row in enumerate(df.itertuples(index=False), start=3):
-            row_bg = LIGHT_GRAY if ri % 2 == 0 else WHITE
+            override = row_fills[ri - 3] if row_fills is not None else None
+            row_bg = override if override else (LIGHT_GRAY if ri % 2 == 0 else WHITE)
             for ci, value in enumerate(row, 1):
                 col_name = df.columns[ci - 1]
 
@@ -499,7 +625,30 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                         f"PERBANDINGAN: {label_a} × {label_b} (overlap ≤ {threshold_m} m)",
                         stats_a, stats_b, label_a, label_b, show_stats=True)
 
-    # Sheet 2: Overlap
+    # Sheet 2: Per Sumur (baris = tiap nama sumur file acuan, urutan asli)
+    if df_per_row is not None and len(df_per_row) > 0:
+        ws_pr = wb.create_sheet("Per Sumur")
+        n_overlap_pr = len(df_per_row[df_per_row["Keterangan"] == "Overlap"])
+        n_redundant_pr = int(df_per_row["_redundant"].sum()) if "_redundant" in df_per_row.columns else 0
+        extra_stats_pr = [
+            ("Total Baris (nama sumur " + per_row_label_p + ")", len(df_per_row)),
+            ("Baris Overlap", n_overlap_pr),
+            ("Baris Tidak Overlap", len(df_per_row) - n_overlap_pr),
+            ("Baris Redundant (biru)", n_redundant_pr),
+        ]
+        if "Status Analisa Spasial" in df_per_row.columns:
+            extra_stats_pr.append(("Lolos Analisa Spasial",
+                                   len(df_per_row[df_per_row["Status Analisa Spasial"] == "Lolos"])))
+            extra_stats_pr.append(("Tidak Lolos Analisa Spasial",
+                                   len(df_per_row[df_per_row["Status Analisa Spasial"] == "Tidak Lolos"])))
+        write_grouped_sheet(ws_pr, df_per_row,
+                            f"PER SUMUR: 1 baris = 1 nama sumur {per_row_label_p} "
+                            f"(redundant dikelompokkan berurutan, warna biru)",
+                            stats_a, stats_b, label_a, label_b, show_stats=False,
+                            extra_stats=extra_stats_pr,
+                            row_fills=per_row_fills(df_per_row))
+
+    # Sheet 3: Overlap
     if len(df_overlap) > 0:
         ws_ov = wb.create_sheet("Overlap")
         extra_stats_overlap = [("Jumlah Titik Overlap", len(df_overlap))]
@@ -514,19 +663,19 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
                             stats_a, stats_b, label_a, label_b, show_stats=True,
                             extra_stats=extra_stats_overlap)
 
-    # Sheet 3: Hanya File A
+    # Sheet 4: Hanya File A
     if len(df_file_a_only) > 0:
         ws_a = wb.create_sheet(f"Hanya {label_a}"[:31])
         write_grouped_sheet(ws_a, df_file_a_only, f"HANYA {label_a.upper()}",
                             stats_a, {}, label_a, label_b, show_stats=False)
 
-    # Sheet 4: Hanya File B
+    # Sheet 5: Hanya File B
     if len(df_file_b_only) > 0:
         ws_b = wb.create_sheet(f"Hanya {label_b}"[:31])
         write_grouped_sheet(ws_b, df_file_b_only, f"HANYA {label_b.upper()}",
                             {}, stats_b, label_a, label_b, show_stats=False)
 
-    # Sheet 5: Lolos Analisa Spasial
+    # Sheet 6: Lolos Analisa Spasial
     if df_lolos_spasial is not None and len(df_lolos_spasial) > 0:
         ws_lolos = wb.create_sheet("Lolos Analisa Spasial")
         extra_stats_lolos = [("Jumlah Titik Lolos Analisa Spasial", len(df_lolos_spasial))]
@@ -546,7 +695,7 @@ def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_l
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 st.title("🗺️ KML/KMZ Compare + Polygon Classifier")
-st.caption("Overlap antar file = jarak haversine ≤ threshold. Koordinat A & B ditampilkan terpisah, full precision (string asli file). Duplikat intra-file default hanya koordinat identik persis.")
+st.caption("Overlap antar file = jarak haversine ≤ threshold. Koordinat A & B ditampilkan terpisah, full precision (string asli file). Duplikat intra-file default hanya koordinat identik persis. Sheet 'Per Sumur' = 1 baris per nama sumur file acuan (bisa dipilih), urutan asli.")
 
 with st.sidebar:
     st.header("⚙️ Pengaturan")
@@ -565,6 +714,17 @@ with st.sidebar:
     )
     st.caption(f"Overlap antar file: ≤ {threshold_m:g} m | Duplikat intra-file: "
                f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
+
+    st.markdown("---")
+    per_sumur_choice = st.radio(
+        "Sheet 'Per Sumur' — baris ikut file mana?",
+        ["Otomatis (file terbanyak)", "Ikut File 1", "Ikut File 2"],
+        index=0,
+        help="Acuan baris di sheet Per Sumur. Otomatis = file dengan jumlah nama sumur terbanyak. "
+             "Pilih 'Ikut File 1' atau 'Ikut File 2' untuk memaksa baris mengikuti file tertentu.",
+    )
+    per_sumur_primary = {"Otomatis (file terbanyak)": "auto",
+                         "Ikut File 1": "a", "Ikut File 2": "b"}[per_sumur_choice]
 
     st.markdown("---")
     use_polygon = st.checkbox("🗺️ Gunakan Polygon Classifier", value=False)
@@ -633,11 +793,21 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                 st.error("❌ Tidak ada titik yang terbaca.")
                 st.stop()
 
+            # Info acuan Per Sumur yang dipakai
+            if per_sumur_primary == "a":
+                acuan_label = label_a
+            elif per_sumur_primary == "b":
+                acuan_label = label_b
+            else:
+                acuan_label = label_a if len(recs_a) >= len(recs_b) else label_b
+
             st.success(f"**{label_a}**: {len(recs_a)} titik | **{label_b}**: {len(recs_b)} titik | "
                        f"Overlap ≤ {threshold_m:g} m | Duplikat intra-file: "
-                       f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
+                       f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'} | "
+                       f"Per Sumur ikut: **{acuan_label}**")
 
-            df_all, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols = build_grouped_comparison(
+            (df_all, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols,
+             clusters_a, clusters_b, matches) = build_grouped_comparison(
                 recs_a, recs_b, threshold_m, dup_threshold_m, label_a, label_b
             )
 
@@ -646,6 +816,12 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                                     (df_all[f"Jumlah Sumur {label_a}"] > 0)].reset_index(drop=True)
             df_file_b_only = df_all[(df_all["Keterangan"] == "Tidak Overlap") &
                                     (df_all[f"Jumlah Sumur {label_b}"] > 0)].reset_index(drop=True)
+
+            # Sheet Per Sumur: baris = tiap nama sumur di file ACUAN pilihan user, urutan asli
+            df_per_row, per_row_label_p, per_row_label_s = build_per_row_comparison(
+                recs_a, recs_b, clusters_a, clusters_b, matches, label_a, label_b,
+                primary=per_sumur_primary
+            )
 
             # Polygon Classifier
             polygon_cols_list = []
@@ -667,7 +843,7 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                     polygon_cols_list.append(col_name)
                     polygon_rules[col_name] = slot['rule']
 
-                    for df in [df_all, df_overlap, df_file_a_only, df_file_b_only]:
+                    for df in [df_all, df_overlap, df_file_a_only, df_file_b_only, df_per_row]:
                         df[col_name] = df.apply(
                             lambda r: 'Dalam' if union_poly.covers(Point(r['_lon'], r['_lat'])) else 'Luar',
                             axis=1
@@ -683,7 +859,7 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
                                 return "Tidak Lolos"
                     return "Lolos"
 
-                for df in [df_all, df_overlap, df_file_a_only, df_file_b_only]:
+                for df in [df_all, df_overlap, df_file_a_only, df_file_b_only, df_per_row]:
                     df["Status Analisa Spasial"] = df.apply(check_lolos_spasial, axis=1)
 
                 df_lolos_spasial = df_overlap[df_overlap["Status Analisa Spasial"] == "Lolos"].reset_index(drop=True)
@@ -703,39 +879,41 @@ if st.button("🚀 PROSES", type="primary", use_container_width=True):
             def preview(df):
                 return df[[c for c in df.columns if not c.startswith("_")]]
 
+            tab_labels = [
+                f"Semua ({len(df_all)})",
+                f"Per Sumur ({len(df_per_row)})",
+                f"Overlap ({len(df_overlap)})",
+                f"Hanya {label_a} ({len(df_file_a_only)})",
+                f"Hanya {label_b} ({len(df_file_b_only)})",
+            ]
             if use_polygon:
-                tabs = st.tabs([
-                    f"Semua ({len(df_all)})",
-                    f"Overlap ({len(df_overlap)})",
-                    f"Hanya {label_a} ({len(df_file_a_only)})",
-                    f"Hanya {label_b} ({len(df_file_b_only)})",
-                    f"Lolos Spasial ({len(df_lolos_spasial)})",
-                ])
-            else:
-                tabs = st.tabs([
-                    f"Semua ({len(df_all)})",
-                    f"Overlap ({len(df_overlap)})",
-                    f"Hanya {label_a} ({len(df_file_a_only)})",
-                    f"Hanya {label_b} ({len(df_file_b_only)})",
-                ])
+                tab_labels.append(f"Lolos Spasial ({len(df_lolos_spasial)})")
+
+            tabs = st.tabs(tab_labels)
 
             with tabs[0]:
                 st.dataframe(preview(df_all), use_container_width=True, height=400)
             with tabs[1]:
-                st.dataframe(preview(df_overlap), use_container_width=True, height=400)
+                st.caption(f"1 baris = 1 nama sumur **{per_row_label_p}** (file acuan). "
+                           f"Redundant (koordinat sama) dikelompokkan berurutan → di Excel diberi warna biru. "
+                           f"Nama {per_row_label_s} digabung pakai koma.")
+                st.dataframe(preview(df_per_row), use_container_width=True, height=400)
             with tabs[2]:
-                st.dataframe(preview(df_file_a_only), use_container_width=True, height=400) if len(df_file_a_only) > 0 else st.info("Kosong")
+                st.dataframe(preview(df_overlap), use_container_width=True, height=400)
             with tabs[3]:
+                st.dataframe(preview(df_file_a_only), use_container_width=True, height=400) if len(df_file_a_only) > 0 else st.info("Kosong")
+            with tabs[4]:
                 st.dataframe(preview(df_file_b_only), use_container_width=True, height=400) if len(df_file_b_only) > 0 else st.info("Kosong")
 
             if use_polygon:
-                with tabs[4]:
+                with tabs[5]:
                     st.dataframe(preview(df_lolos_spasial), use_container_width=True, height=400) if len(df_lolos_spasial) > 0 else st.info("Kosong")
 
             st.markdown("---")
 
             excel_bytes = build_excel_grouped(
                 df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
+                df_per_row, per_row_label_p,
                 label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
                 coord_cols, polygon_cols_list
             )
