@@ -1,901 +1,867 @@
-import streamlit as st
-import pandas as pd
-import zipfile
+"""
+KMZ vs Excel Well Compare — Per Sumur
+File 1 : KML/KMZ (acuan baris)
+File 2 : Excel (urutan kolom: Nama, X DB, Y DB, X Evaluasi, Y Evaluasi,
+         Jarak Deviasi, Status Verifikasi, Nama BKU)
+Run    : streamlit run compare_kmz_excel.py
+"""
 import io
 import os
-from xml.etree import ElementTree as ET
-from math import radians, cos, sin, asin, sqrt
+import re
+import zipfile
 from collections import defaultdict
-from shapely.geometry import Point, Polygon
-from shapely.ops import unary_union
+from math import radians, cos, sin, asin, sqrt
+from xml.etree import ElementTree as ET
+
+import pandas as pd
+import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union
+from shapely.prepared import prep
+try:
+    from shapely.validation import make_valid
+except ImportError:  # shapely < 1.8
+    make_valid = lambda g: g.buffer(0)
 
-st.set_page_config(page_title="KML/KMZ Compare + Polygon Classifier", page_icon="🗺️", layout="wide")
+# ── KONSTANTA ────────────────────────────────────────────────────────────────
+EXCEL_COLS = ["Nama Sumur", "Koordinat Database X", "Koordinat Database Y",
+              "Koordinat Hasil Evaluasi X", "Koordinat Hasil Evaluasi Y",
+              "Jarak Deviasi (meter)", "Status Verifikasi", "Nama BKU"]
 
-KML_NS = "http://www.opengis.net/kml/2.2"
+ST_SESUAI = "Sesuai Database"
+ST_GESER = "Tidak Sesuai - Bergeser"
+ST_TIDAK = "Tidak Ditemukan"
+
+
+def status_priority(status):
+    """0 = Sesuai Database, 1 = Bergeser, 2 = Tidak Ditemukan / lainnya."""
+    s = str(status or "").strip().lower()
+    if "sesuai database" in s and "tidak" not in s:
+        return 0
+    if "bergeser" in s:
+        return 1
+    return 2
+
+
+def status_label(status):
+    return {0: ST_SESUAI, 1: ST_GESER, 2: ST_TIDAK}[status_priority(status)]
 
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
-
-def filename_to_label(uploaded_file):
-    if uploaded_file is None:
-        return ""
-    base = os.path.splitext(uploaded_file.name)[0]
-    return base.replace("_", " ").replace("-", " ")
-
-
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6_371_000
-    phi1, phi2 = radians(lat1), radians(lat2)
-    a = sin((phi2 - phi1) / 2) ** 2 + cos(phi1) * cos(phi2) * sin((radians(lon2 - lon1)) / 2) ** 2
+    p1, p2 = radians(lat1), radians(lat2)
+    a = sin((p2 - p1) / 2) ** 2 + cos(p1) * cos(p2) * sin(radians(lon2 - lon1) / 2) ** 2
     return 2 * R * asin(sqrt(a))
 
 
-def extract_digits(name):
-    return ''.join(c for c in name if c.isdigit())
+def digits(name):
+    return "".join(c for c in str(name) if c.isdigit())
 
 
-def compare_names_by_digits(name_a, name_b):
-    digits_a = extract_digits(name_a)
-    digits_b = extract_digits(name_b)
-
-    if not digits_a or not digits_b:
-        return "Tidak Ada Digit"
-
-    if len(digits_a) >= 4 and len(digits_b) >= 4:
-        if digits_a[-4:] == digits_b[-4:]:
-            return "Sama"
-
-    if digits_a == digits_b:
-        return "Sama"
-
-    for i in range(len(digits_a) - 3):
-        if digits_a[i:i+4] in digits_b:
-            return "Sama"
-
-    return "Berbeda"
+def name_match(a, b):
+    """True kalau nama identik (abaikan spasi/tanda baca/case) atau 4 digit terakhir sama."""
+    na = re.sub(r"[^A-Z0-9]", "", str(a).upper())
+    nb = re.sub(r"[^A-Z0-9]", "", str(b).upper())
+    if na and na == nb:
+        return True
+    da, db = digits(a), digits(b)
+    return len(da) >= 4 and len(db) >= 4 and da[-4:] == db[-4:]
 
 
-def extract_kml_bytes(uploaded_file):
-    name = uploaded_file.name.lower()
-    raw = uploaded_file.read()
-    if name.endswith(".kmz"):
+def _tag(el):
+    return el.tag.rsplit("}", 1)[-1]
+
+
+# ── FILE 1: KML/KMZ ──────────────────────────────────────────────────────────
+def read_kml_bytes(uploaded):
+    raw = uploaded.getvalue()
+    if uploaded.name.lower().endswith(".kmz"):
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
-            kml_names = [n for n in z.namelist() if n.lower().endswith(".kml")]
-            if not kml_names:
-                st.error(f"Tidak ada file .kml di dalam {uploaded_file.name}")
-                return None
-            return z.read(kml_names[0])
+            kmls = [n for n in z.namelist() if n.lower().endswith(".kml")]
+            if not kmls:
+                raise ValueError(f"Tidak ada .kml di dalam {uploaded.name}")
+            kmls.sort(key=lambda n: (os.path.basename(n).lower() != "doc.kml", n))
+            return z.read(kmls[0])
     return raw
 
 
-def parse_kml(kml_bytes, label="File"):
-    """
-    Parse titik KML → list dict.
-    lat_str/lon_str = STRING ASLI dari file → dipakai di output (full precision, zero rounding).
-    """
-    ns = {"kml": KML_NS}
-    try:
-        root = ET.fromstring(kml_bytes)
-    except ET.ParseError as e:
-        st.error(f"Gagal parse KML ({label}): {e}")
-        return []
-
-    records = []
-    for pm in root.findall(".//kml:Placemark", ns):
-        name_el = pm.find("kml:name", ns)
-        name = name_el.text.strip() if name_el is not None and name_el.text else ""
-        ext_data = {}
-        schema_data = pm.find(".//kml:SchemaData", ns)
-        if schema_data is not None:
-            for sd in schema_data.findall("kml:SimpleData", ns):
-                k = sd.get("name", "")
-                v = sd.text.strip() if sd.text else ""
-                ext_data[k] = v
-            if not name:
-                name = (ext_data.get("NO_SUMUR") or ext_data.get("Name_1")
-                        or ext_data.get("name") or "")
-        pt = pm.find(".//kml:Point/kml:coordinates", ns)
-        if pt is None or not pt.text:
-            continue
-        parts = pt.text.strip().split(",")
-        if len(parts) < 2:
-            continue
-        lon_str = parts[0].strip()
-        lat_str = parts[1].strip()
-        try:
-            lon, lat = float(lon_str), float(lat_str)
-        except ValueError:
-            continue
-        records.append({"name": name, "lat": lat, "lon": lon,
-                        "lat_str": lat_str, "lon_str": lon_str,
-                        "order": len(records)})
-    return records
-
-
-def extract_polygons_from_kml(kml_bytes):
-    """Extract Shapely Polygon dari KML bytes"""
-    ns = {'kml': KML_NS}
+def parse_kml_points(kml_bytes):
+    """Namespace-agnostic. Ambil semua Placemark yang punya Point (termasuk dalam MultiGeometry)."""
     root = ET.fromstring(kml_bytes)
+    recs = []
+    for pm in root.iter():
+        if _tag(pm) != "Placemark":
+            continue
+        name, ext = "", {}
+        for ch in pm:
+            if _tag(ch) == "name" and ch.text:
+                name = ch.text.strip()
+        for el in pm.iter():
+            t = _tag(el)
+            if t == "SimpleData":
+                ext[el.get("name", "")] = (el.text or "").strip()
+            elif t == "Data":
+                for v in el:
+                    if _tag(v) == "value":
+                        ext[el.get("name", "")] = (v.text or "").strip()
+        if not name:
+            for k in ("NO_SUMUR", "Name_1", "name", "Name", "NAMA"):
+                if ext.get(k):
+                    name = ext[k]
+                    break
+        coord_text = None
+        for el in pm.iter():
+            if _tag(el) == "Point":
+                for c in el:
+                    if _tag(c) == "coordinates" and c.text:
+                        coord_text = c.text
+                break
+        if not coord_text:
+            continue
+        parts = coord_text.strip().split()[0].split(",")
+        try:
+            lon, lat = float(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            continue
+        recs.append({"name": name, "lon": lon, "lat": lat,
+                     "lon_str": parts[0].strip(), "lat_str": parts[1].strip(),
+                     "order": len(recs)})
+    return recs
 
-    def parse_coords(text):
-        pts = []
-        for pt in text.strip().split():
-            p = pt.split(',')
-            if len(p) >= 2:
-                try:
-                    pts.append((float(p[0]), float(p[1])))
-                except:
-                    pass
-        return pts
 
-    polygons = []
-    for coords_el in root.findall('.//kml:Polygon//kml:outerBoundaryIs//kml:coordinates', ns):
-        if coords_el.text:
-            pts = parse_coords(coords_el.text)
-            if len(pts) >= 3:
-                polygons.append(Polygon(pts))
-
-    if not polygons:
-        for pm in root.findall('.//kml:Placemark', ns):
-            if pm.find('.//kml:Point', ns) is None:
-                for cel in pm.findall('.//kml:coordinates', ns):
-                    if cel.text:
-                        pts = parse_coords(cel.text)
-                        if len(pts) >= 3:
-                            polygons.append(Polygon(pts))
-    return polygons
+# ── POLYGON ──────────────────────────────────────────────────────────────────
+POLY_RULES = ["Hanya Info (tidak difilter)", "Lolos jika Dalam", "Lolos jika Luar"]
 
 
-# ── CLUSTERING & MATCHING ────────────────────────────────────────────────────
+def _coords(text):
+    pts = []
+    for tok in (text or "").strip().split():
+        p = tok.split(",")
+        if len(p) >= 2:
+            try:
+                pts.append((float(p[0]), float(p[1])))
+            except ValueError:
+                pass
+    return pts
 
-def _grid_cell(lat, lon, cell_deg):
-    return (int(lat // cell_deg), int(lon // cell_deg))
+
+def parse_kml_polygons(kml_bytes):
+    """Namespace-agnostic. Ambil semua Polygon (outer + hole), auto-fix polygon invalid."""
+    root = ET.fromstring(kml_bytes)
+    polys = []
+    for pg in root.iter():
+        if _tag(pg) != "Polygon":
+            continue
+        outer, holes = None, []
+        for b in pg:
+            ring = None
+            for el in b.iter():
+                if _tag(el) == "coordinates":
+                    ring = _coords(el.text)
+                    break
+            if not ring or len(ring) < 3:
+                continue
+            if _tag(b) == "outerBoundaryIs":
+                outer = ring
+            elif _tag(b) == "innerBoundaryIs":
+                holes.append(ring)
+        if outer:
+            g = Polygon(outer, holes)
+            polys.append(g if g.is_valid else make_valid(g))
+    if not polys:  # fallback: LinearRing / LineString tertutup
+        for el in root.iter():
+            if _tag(el) in ("LinearRing", "LineString"):
+                for c in el:
+                    if _tag(c) == "coordinates":
+                        ring = _coords(c.text)
+                        if len(ring) >= 3:
+                            g = Polygon(ring)
+                            polys.append(g if g.is_valid else make_valid(g))
+    return polys
 
 
-def cluster_points(recs, threshold_m):
+def apply_polygons(df, polygons, lon_c, lat_c):
+    """polygons: list dict {col, geom, rule}. Tambah kolom Dalam/Luar + Status Analisa Spasial."""
+    if df.empty or not polygons:
+        return df
+    df = df.copy()
+    for p in polygons:
+        pg = prep(p["geom"])
+        df[p["col"]] = [("Dalam" if pg.covers(Point(x, y)) else "Luar")
+                        for x, y in zip(df[lon_c], df[lat_c])]
+
+    def lolos(r):
+        for p in polygons:
+            if p["rule"] == "Lolos jika Dalam" and r[p["col"]] != "Dalam":
+                return "Tidak Lolos"
+            if p["rule"] == "Lolos jika Luar" and r[p["col"]] != "Luar":
+                return "Tidak Lolos"
+        return "Lolos"
+
+    df["Status Analisa Spasial"] = df.apply(lolos, axis=1)
+    return df
+
+
+def sort_per_sumur(df, df_red):
     """
-    Kelompokkan titik duplikat dalam SATU file jadi satu 'lokasi'.
-
-    threshold_m = 0 (DEFAULT) → HANYA titik dengan koordinat IDENTIK PERSIS
-    (string sama) yang digabung. Sumur berbeda yang jaraknya dekat (mis. 3–4 m)
-    TETAP jadi lokasi terpisah, masing-masing dengan koordinat aslinya.
-
-    threshold_m > 0 → titik berjarak ≤ threshold digabung (haversine + grid index).
+    Urutan: Lolos spasial dulu → Tidak Lolos; di dalamnya Berpasangan dulu → Tidak Berpasangan.
+    Grup koordinat duplikat tetap berurutan. Kolom No dinomori ulang,
+    referensi 'No Baris (Per Sumur)' di sheet Redundant ikut di-update.
     """
-    if threshold_m <= 0:
-        groups = defaultdict(list)
-        for rec in recs:
-            groups[(rec["lat_str"], rec["lon_str"])].append(rec)
-        return [{
-            "lat": g[0]["lat"], "lon": g[0]["lon"],
-            "lat_str": g[0]["lat_str"], "lon_str": g[0]["lon_str"],
-            "recs": g,
-        } for g in groups.values()]
+    if df.empty:
+        return df, df_red
+    df = df.copy()
+    sp = df["Status Analisa Spasial"] if "Status Analisa Spasial" in df.columns else pd.Series("Lolos", index=df.index)
+    df["_k_sp"] = (sp != "Lolos").astype(int)
+    df["_k_pair"] = (df["Keterangan"] == "Tidak Berpasangan").astype(int)
+    df["_k_row"] = range(len(df))
+    # kunci grup = kunci terbaik anggota grup → anggota grup tidak terpisah
+    df["_g_sp"] = df.groupby("_grup")["_k_sp"].transform("min")
+    df["_g_pair"] = df.groupby("_grup")["_k_pair"].transform("min")
+    df = df.sort_values(["_g_sp", "_g_pair", "_grup", "_k_row"], kind="stable").reset_index(drop=True)
+    df["No"] = range(1, len(df) + 1)
+    first_no = df.groupby("_grup")["No"].min()
+    df = df.drop(columns=["_k_sp", "_k_pair", "_k_row", "_g_sp", "_g_pair"])
+    if len(df_red):
+        df_red = df_red.copy()
+        df_red["No Baris (Per Sumur)"] = df_red["_grup"].map(first_no)
+    return df, df_red
 
-    cell_deg = max(threshold_m / 111320.0, 1e-9)
-    grid = defaultdict(list)
-    clusters = []
 
-    for rec in recs:
-        ci, cj = _grid_cell(rec["lat"], rec["lon"], cell_deg)
-        found = None
+def sort_spasial(df):
+    """Lolos spasial dulu, urutan asli dipertahankan."""
+    if df.empty or "Status Analisa Spasial" not in df.columns:
+        return df
+    k = (df["Status Analisa Spasial"] != "Lolos").astype(int)
+    return df.assign(_k=k).sort_values("_k", kind="stable").drop(columns="_k").reset_index(drop=True)
+
+
+# ── FILE 2: EXCEL ────────────────────────────────────────────────────────────
+def parse_excel(uploaded, sheet=0):
+    df = pd.read_excel(uploaded, sheet_name=sheet, header=0)
+    if df.shape[1] < 3:
+        raise ValueError("Excel minimal 3 kolom (Nama, X, Y).")
+    df = df.iloc[:, :8].copy()
+    while df.shape[1] < 8:
+        df[f"_pad{df.shape[1]}"] = None
+    df.columns = EXCEL_COLS
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    recs, skipped = [], []
+    for i, r in df.iterrows():
+        x = pd.to_numeric(r[EXCEL_COLS[1]], errors="coerce")
+        y = pd.to_numeric(r[EXCEL_COLS[2]], errors="coerce")
+        name = "(tanpa nama)" if pd.isna(r[EXCEL_COLS[0]]) else str(r[EXCEL_COLS[0]]).strip()
+        info = {c: (None if pd.isna(r[c]) else r[c]) for c in EXCEL_COLS[3:]}
+        rec = {"name": name, "lon": x, "lat": y, "order": i, **info,
+               "_prio": status_priority(info["Status Verifikasi"])}
+        if pd.isna(x) or pd.isna(y):
+            skipped.append(rec)
+            continue
+        rec["lon_str"], rec["lat_str"] = repr(float(x)), repr(float(y))
+        recs.append(rec)
+    return recs, skipped, df
+
+
+# ── CLUSTER & MATCH ──────────────────────────────────────────────────────────
+def _cell(lat, lon, deg):
+    return int(lat // deg), int(lon // deg)
+
+
+def cluster_points(recs, dup_m):
+    """dup_m = 0 → hanya koordinat identik. > 0 → gabung titik ≤ dup_m meter."""
+    if dup_m <= 0:
+        g = defaultdict(list)
+        for r in recs:
+            g[(r["lat"], r["lon"])].append(r)
+        return [{"lat": v[0]["lat"], "lon": v[0]["lon"], "recs": v} for v in g.values()]
+    deg = max(dup_m / 111_320.0, 1e-9)
+    grid, clusters = defaultdict(list), []
+    for r in recs:
+        ci, cj = _cell(r["lat"], r["lon"], deg)
+        hit = None
         for di in (-1, 0, 1):
             for dj in (-1, 0, 1):
                 for k in grid.get((ci + di, cj + dj), []):
-                    c = clusters[k]
-                    if haversine_m(rec["lat"], rec["lon"], c["lat"], c["lon"]) <= threshold_m:
-                        found = k
+                    if haversine_m(r["lat"], r["lon"], clusters[k]["lat"], clusters[k]["lon"]) <= dup_m:
+                        hit = k
                         break
-                if found is not None:
+                if hit is not None:
                     break
-            if found is not None:
+            if hit is not None:
                 break
-
-        if found is not None:
-            clusters[found]["recs"].append(rec)
-        else:
-            clusters.append({
-                "lat": rec["lat"], "lon": rec["lon"],
-                "lat_str": rec["lat_str"], "lon_str": rec["lon_str"],
-                "recs": [rec],
-            })
+        if hit is None:
+            clusters.append({"lat": r["lat"], "lon": r["lon"], "recs": [r]})
             grid[(ci, cj)].append(len(clusters) - 1)
-
+        else:
+            clusters[hit]["recs"].append(r)
     return clusters
 
 
-def match_clusters(clusters_a, clusters_b, threshold_m):
-    """
-    Greedy 1-to-1 matching antar lokasi A dan B berdasarkan jarak haversine,
-    pair TERDEKAT diprioritaskan. Overlap = jarak ≤ threshold_m.
-    """
-    cell_deg = max(threshold_m / 111320.0, 1e-9)
-    grid_b = defaultdict(list)
-    for j, c in enumerate(clusters_b):
-        grid_b[_grid_cell(c["lat"], c["lon"], cell_deg)].append(j)
-
-    candidates = []
-    for i, ca in enumerate(clusters_a):
-        ci, cj = _grid_cell(ca["lat"], ca["lon"], cell_deg)
+def match_clusters(ca, cb, thr_m):
+    """Greedy 1-to-1 antar lokasi, pasangan terdekat duluan."""
+    deg = max(thr_m / 111_320.0, 1e-9)
+    grid = defaultdict(list)
+    for j, c in enumerate(cb):
+        grid[_cell(c["lat"], c["lon"], deg)].append(j)
+    cand = []
+    for i, c in enumerate(ca):
+        ci, cj = _cell(c["lat"], c["lon"], deg)
         for di in (-1, 0, 1):
             for dj in (-1, 0, 1):
-                for j in grid_b.get((ci + di, cj + dj), []):
-                    cb = clusters_b[j]
-                    d = haversine_m(ca["lat"], ca["lon"], cb["lat"], cb["lon"])
-                    if d <= threshold_m:
-                        candidates.append((d, i, j))
-
-    candidates.sort()
-    matched_a, matched_b, matches = set(), set(), []
-    for d, i, j in candidates:
-        if i in matched_a or j in matched_b:
+                for j in grid.get((ci + di, cj + dj), []):
+                    d = haversine_m(c["lat"], c["lon"], cb[j]["lat"], cb[j]["lon"])
+                    if d <= thr_m:
+                        cand.append((d, i, j))
+    cand.sort()
+    ua, ub, out = set(), set(), {}
+    for d, i, j in cand:
+        if i in ua or j in ub:
             continue
-        matched_a.add(i)
-        matched_b.add(j)
-        matches.append((i, j, d))
-
-    return matches, matched_a, matched_b
+        ua.add(i); ub.add(j)
+        out[i] = (j, d)
+    return out
 
 
-def _cluster_stats(clusters, recs):
-    return {
-        "total_koordinat": len(clusters),
-        "total_nama": len(recs),
-        "dup_3": sum(1 for c in clusters if len(c["recs"]) >= 3),
-        "dup_2": sum(1 for c in clusters if len(c["recs"]) == 2),
-        "dup_1": sum(1 for c in clusters if len(c["recs"]) == 1),
-    }
-
-
-def build_grouped_comparison(recs_a, recs_b, threshold_m, dup_threshold_m, label_a, label_b):
+# ── PAIRING DALAM 1 GRUP ─────────────────────────────────────────────────────
+def pair_group(kmz_recs, xl_recs):
     """
-    - Duplikat intra-file: dup_threshold_m (default 0 = hanya koordinat identik persis).
-    - Overlap antar file: jarak haversine ≤ threshold_m.
-    - Koordinat A dan B DITAMPILKAN TERPISAH, string asli file (full precision).
+    kmz_recs : n nama (urutan file KMZ)
+    xl_recs  : m nama Excel di koordinat pasangan
+    Return   : list (kmz_rec, xl_rec, ket) panjang n, list redundant (sisa Excel)
+    Rules:
+      - Prioritas pasangan: Sesuai Database > Bergeser > Tidak Ditemukan.
+      - m > n : n terbaik dipasang, sisa (Tidak Ditemukan duluan) → redundant.
+      - m < n : semua Excel dipakai, baris sisa diisi ulang (berulang).
+      - Di dalam yang terpilih, nama yang cocok (identik/4 digit akhir) dipasang duluan.
     """
-    clusters_a = cluster_points(recs_a, dup_threshold_m)
-    clusters_b = cluster_points(recs_b, dup_threshold_m)
-
-    matches, matched_a, matched_b = match_clusters(clusters_a, clusters_b, threshold_m)
-
-    max_dup_a = max([len(c["recs"]) for c in clusters_a], default=1)
-    max_dup_b = max([len(c["recs"]) for c in clusters_b], default=1)
-
-    col_lat_a = f"Latitude {label_a}"
-    col_lon_a = f"Longitude {label_a}"
-    col_lat_b = f"Latitude {label_b}"
-    col_lon_b = f"Longitude {label_b}"
-
-    rows = []
-
-    def make_row(ca, cb, dist_m):
-        row = {}
-        # Koordinat A & B masing-masing, string asli file → jelas terlihat bedanya
-        row[col_lat_a] = ca["lat_str"] if ca is not None else ""
-        row[col_lon_a] = ca["lon_str"] if ca is not None else ""
-        row[col_lat_b] = cb["lat_str"] if cb is not None else ""
-        row[col_lon_b] = cb["lon_str"] if cb is not None else ""
-
-        recs_at_a = ca["recs"] if ca is not None else []
-        recs_at_b = cb["recs"] if cb is not None else []
-
-        for i in range(max_dup_a):
-            row[f"Nama {label_a} - Titik {i+1}"] = recs_at_a[i]["name"] if i < len(recs_at_a) else ""
-        row[f"Jumlah Sumur {label_a}"] = len(recs_at_a)
-
-        for i in range(max_dup_b):
-            row[f"Nama {label_b} - Titik {i+1}"] = recs_at_b[i]["name"] if i < len(recs_at_b) else ""
-        row[f"Jumlah Sumur {label_b}"] = len(recs_at_b)
-
-        if recs_at_a and recs_at_b:
-            row["Kesamaan Nama"] = compare_names_by_digits(recs_at_a[0]["name"], recs_at_b[0]["name"])
-        else:
-            row["Kesamaan Nama"] = "-"
-
-        row["Jarak (m)"] = round(dist_m, 2) if dist_m is not None else ""
-        row["Keterangan"] = "Overlap" if (recs_at_a and recs_at_b) else "Tidak Overlap"
-
-        src = ca if ca is not None else cb
-        row["_lat"] = src["lat"]
-        row["_lon"] = src["lon"]
-        return row
-
-    for i, j, d in matches:
-        rows.append(make_row(clusters_a[i], clusters_b[j], d))
-
-    for i, ca in enumerate(clusters_a):
-        if i not in matched_a:
-            rows.append(make_row(ca, None, None))
-
-    for j, cb in enumerate(clusters_b):
-        if j not in matched_b:
-            rows.append(make_row(None, cb, None))
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values(["_lat", "_lon"]).reset_index(drop=True)
-
-    stats_a = _cluster_stats(clusters_a, recs_a)
-    stats_b = _cluster_stats(clusters_b, recs_b)
-
-    coord_cols = [col_lat_a, col_lon_a, col_lat_b, col_lon_b]
-
-    return (df, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols,
-            clusters_a, clusters_b, matches)
-
-
-# ── PER SUMUR (1 BARIS = 1 NAMA SUMUR, URUTAN ASLI FILE TERBANYAK) ───────────
-
-def _map_rec_to_cluster(clusters):
-    m = {}
-    for idx, c in enumerate(clusters):
-        for rec in c["recs"]:
-            m[id(rec)] = idx
-    return m
-
-
-def build_per_row_comparison(recs_a, recs_b, clusters_a, clusters_b, matches,
-                             label_a, label_b):
-    """
-    Sheet 'Per Sumur':
-    - Baris mengikuti file dengan JUMLAH NAMA TERBANYAK (primary), urutan ASLI file.
-    - Setiap nama sumur = 1 baris, walau koordinatnya duplikat/redundant.
-      Contoh: x1 & x2 di koordinat sama → tetap 2 baris terpisah.
-    - Tiap baris dipasangkan dengan lokasi match di file satunya (secondary):
-      semua nama di lokasi itu (y1, y2, y3) tampil di kolom perbandingan,
-      lengkap koordinat, kesamaan nama, jarak, keterangan.
-    """
-    if len(recs_a) >= len(recs_b):
-        recs_p, clusters_p = recs_a, clusters_a
-        clusters_s = clusters_b
-        label_p, label_s = label_a, label_b
-        match_map = {i: (j, d) for i, j, d in matches}
+    n, m = len(kmz_recs), len(xl_recs)
+    ranked = sorted(xl_recs, key=lambda r: (r["_prio"], r["order"]))
+    if m > n:
+        chosen, redundant = ranked[:n], ranked[n:]
+        redundant = sorted(redundant, key=lambda r: (-r["_prio"], r["order"]))
     else:
-        recs_p, clusters_p = recs_b, clusters_b
-        clusters_s = clusters_a
-        label_p, label_s = label_b, label_a
-        match_map = {j: (i, d) for i, j, d in matches}
+        chosen, redundant = ranked, []
 
-    col_lat_p = f"Latitude {label_p}"
-    col_lon_p = f"Longitude {label_p}"
-    col_lat_s = f"Latitude {label_s}"
-    col_lon_s = f"Longitude {label_s}"
+    assign = [None] * n
+    free = list(chosen)
+    # 1) nama cocok
+    for i, k in enumerate(kmz_recs):
+        for x in free:
+            if name_match(k["name"], x["name"]):
+                assign[i] = (x, "Berpasangan")
+                free.remove(x)
+                break
+    # 2) sisa terpilih sesuai urutan prioritas
+    for i in range(n):
+        if assign[i] is None and free:
+            assign[i] = (free.pop(0), "Berpasangan")
+    # 3) m < n → isi berulang, mulai dari prioritas terbaik
+    rep = 0
+    for i in range(n):
+        if assign[i] is None:
+            assign[i] = (ranked[rep % len(ranked)], "Pasangan Berulang")
+            rep += 1
+    return [(kmz_recs[i], assign[i][0], assign[i][1]) for i in range(n)], redundant
 
-    # Urutkan cluster berdasarkan kemunculan pertama di file (urutan asli),
-    # anggota redundant dalam 1 cluster ditulis BERURUTAN (dikelompokkan).
-    ordered_clusters = sorted(
-        range(len(clusters_p)),
-        key=lambda ci: min(r["order"] for r in clusters_p[ci]["recs"])
-    )
 
-    rows = []
+# ── BUILD ────────────────────────────────────────────────────────────────────
+def build(kmz_recs, xl_recs, thr_m, dup_m, lbl1, lbl2):
+    ck = cluster_points(kmz_recs, dup_m)
+    cx = cluster_points(xl_recs, dup_m)
+    mm = match_clusters(ck, cx, thr_m)
+
+    order = sorted(range(len(ck)), key=lambda i: min(r["order"] for r in ck[i]["recs"]))
+    rows, redundant_rows = [], []
+    used_x, paired_x, red_x = set(), {}, {}
     no = 0
-    for grp_id, ci in enumerate(ordered_clusters, start=1):
-        cluster = clusters_p[ci]
-        member_recs = sorted(cluster["recs"], key=lambda r: r["order"])
-        is_redundant = len(member_recs) > 1
-        pair = match_map.get(ci)
+    for gid, ci in enumerate(order, start=1):
+        members = sorted(ck[ci]["recs"], key=lambda r: r["order"])
+        n = len(members)
+        pair = mm.get(ci)
+        if pair:
+            j, dist = pair
+            xs = cx[j]["recs"]
+            pairs, red = pair_group(members, xs)
+            for x in xs:
+                used_x.add(id(x))
+        else:
+            dist, xs, red = None, [], []
+            pairs = [(k, None, "Tidak Berpasangan") for k in members]
 
-        for rec in member_recs:
+        for idx, (k, x, ket) in enumerate(pairs):
             no += 1
-            row = {"No": no, f"Nama {label_p}": rec["name"],
-                   col_lat_p: rec["lat_str"], col_lon_p: rec["lon_str"],
-                   f"Jumlah Redundant {label_p}": len(member_recs)}
-
-            if pair is not None:
-                cs = clusters_s[pair[0]]
-                names_s = [r["name"] for r in cs["recs"]]
-                row[f"Nama {label_s}"] = ", ".join(names_s)
-                row[f"Jumlah Sumur {label_s}"] = len(names_s)
-                row[col_lat_s] = cs["lat_str"]
-                row[col_lon_s] = cs["lon_str"]
-                row["Kesamaan Nama"] = compare_names_by_digits(rec["name"], names_s[0])
-                row["Jarak (m)"] = round(pair[1], 2)
-                row["Keterangan"] = "Overlap"
-            else:
-                row[f"Nama {label_s}"] = ""
-                row[f"Jumlah Sumur {label_s}"] = 0
-                row[col_lat_s] = ""
-                row[col_lon_s] = ""
-                row["Kesamaan Nama"] = "-"
-                row["Jarak (m)"] = ""
-                row["Keterangan"] = "Tidak Overlap"
-
-            row["_lat"] = rec["lat"]
-            row["_lon"] = rec["lon"]
-            row["_grup"] = grp_id
-            row["_redundant"] = is_redundant
+            if x is not None:
+                paired_x.setdefault(id(x), (x, []))[1].append(no)
+            row = {
+                "No": no,
+                f"Nama Sumur {lbl1}": k["name"],
+                f"Longitude {lbl1}": k["lon"],
+                f"Latitude {lbl1}": k["lat"],
+                f"Jumlah Sumur di Koordinat ({lbl1})": n,
+                f"Nama Sumur {lbl2}": x["name"] if x else "",
+                "Koordinat Database X": x["lon"] if x else "",
+                "Koordinat Database Y": x["lat"] if x else "",
+                "Koordinat Hasil Evaluasi X": (x["Koordinat Hasil Evaluasi X"] if x else "") or "",
+                "Koordinat Hasil Evaluasi Y": (x["Koordinat Hasil Evaluasi Y"] if x else "") or "",
+                "Jarak Deviasi (meter)": (x["Jarak Deviasi (meter)"] if x else ""),
+                "Status Verifikasi": (x["Status Verifikasi"] if x else "") or "",
+                "Nama BKU": (x["Nama BKU"] if x else "") or "",
+                f"Jumlah Sumur di Koordinat ({lbl2})": len(xs),
+                f"Jarak {lbl1}-{lbl2} (m)": round(dist, 3) if dist is not None else "",
+                "Kesamaan Nama": ("Sama" if name_match(k["name"], x["name"]) else "Berbeda") if x else "-",
+                "Redundant Well": ", ".join(r["name"] for r in red) if (idx == 0 and red) else "",
+                "Status Redundant Well": ", ".join(status_label(r["Status Verifikasi"]) for r in red)
+                if (idx == 0 and red) else "",
+                "Keterangan": ket,
+                "_grup": gid, "_dup": n > 1,
+            }
+            if row["Jarak Deviasi (meter)"] is None:
+                row["Jarak Deviasi (meter)"] = ""
             rows.append(row)
 
-    df = pd.DataFrame(rows)
-    return df, label_p, label_s
+        for r in red:
+            red_x[id(r)] = ", ".join(k["name"] for k in members)
+            redundant_rows.append({
+                f"Nama Sumur {lbl2}": r["name"],
+                "Koordinat Database X": r["lon"], "Koordinat Database Y": r["lat"],
+                "Status Verifikasi": r["Status Verifikasi"] or "",
+                "Nama BKU": r["Nama BKU"] or "",
+                f"Grup Sumur {lbl1}": ", ".join(k["name"] for k in members),
+                "No Baris (Per Sumur)": rows[-n]["No"],
+                "_grup": gid,
+            })
+
+    unmatched_x = [{
+        f"Nama Sumur {lbl2}": r["name"],
+        "Koordinat Database X": r["lon"], "Koordinat Database Y": r["lat"],
+        "Koordinat Hasil Evaluasi X": r["Koordinat Hasil Evaluasi X"] or "",
+        "Koordinat Hasil Evaluasi Y": r["Koordinat Hasil Evaluasi Y"] or "",
+        "Jarak Deviasi (meter)": "" if r["Jarak Deviasi (meter)"] is None else r["Jarak Deviasi (meter)"],
+        "Status Verifikasi": r["Status Verifikasi"] or "",
+        "Nama BKU": r["Nama BKU"] or "",
+    } for r in sorted(xl_recs, key=lambda r: r["order"]) if id(r) not in used_x]
+
+    # semua sumur Excel + status pasangannya (untuk sheet Analisa Spasial File 2)
+    nos_by_x = {i: v[1] for i, v in paired_x.items()}
+    kmz_by_no = {r["No"]: r[f"Nama Sumur {lbl1}"] for r in rows}
+    xl_all = []
+    for r in sorted(xl_recs, key=lambda r: r["order"]):
+        if id(r) in paired_x:
+            stp, ref = "Berpasangan", ", ".join(kmz_by_no[n] for n in nos_by_x[id(r)])
+        elif id(r) in red_x:
+            stp, ref = "Redundant Well", red_x[id(r)]
+        else:
+            stp, ref = "Tidak Berpasangan", ""
+        xl_all.append({
+            f"Nama Sumur {lbl2}": r["name"],
+            "Koordinat Database X": r["lon"], "Koordinat Database Y": r["lat"],
+            "Koordinat Hasil Evaluasi X": r["Koordinat Hasil Evaluasi X"] or "",
+            "Koordinat Hasil Evaluasi Y": r["Koordinat Hasil Evaluasi Y"] or "",
+            "Jarak Deviasi (meter)": "" if r["Jarak Deviasi (meter)"] is None else r["Jarak Deviasi (meter)"],
+            "Status Verifikasi": r["Status Verifikasi"] or "",
+            "Nama BKU": r["Nama BKU"] or "",
+            f"Status Pasangan ke {lbl1}": stp,
+            f"Pasangan {lbl1}": ref,
+            "_prio": r["_prio"], "_order": r["order"],
+        })
+
+    df_main = pd.DataFrame(rows)
+    df_red = pd.DataFrame(redundant_rows)
+    df_unx = pd.DataFrame(unmatched_x)
+    df_xl_all = pd.DataFrame(xl_all)
+    # paired: list (rec_excel, [No baris Per Sumur sebelum sort]) → dipakai filter Lolos
+    return df_main, df_red, df_unx, ck, cx, list(paired_x.values()), df_xl_all
 
 
-def per_row_fills(df_per_row):
-    """
-    Warna baris sheet Per Sumur: kelompok redundant diberi warna biru,
-    2 shade biru bergantian antar grup redundant yang bersebelahan
-    biar batas antar kelompok keliatan jelas.
-    """
-    BLUE_1 = "DDEBF7"
-    BLUE_2 = "B4C6E7"
-    fills = []
-    shade_toggle = 0
-    prev_grup = None
-    for _, r in df_per_row.iterrows():
-        if r["_redundant"]:
-            if r["_grup"] != prev_grup:
-                shade_toggle ^= 1
-            fills.append(BLUE_1 if shade_toggle else BLUE_2)
-            prev_grup = r["_grup"]
+def bku_table(recs):
+    """Rekap per Nama BKU: Sesuai, Bergeser, Tidak Ditemukan."""
+    d = defaultdict(lambda: [0, 0, 0])
+    for r in recs:
+        bku = str(r.get("Nama BKU") or "(Tanpa Nama BKU)").strip()
+        d[bku][r["_prio"]] += 1
+    out = []
+    for bku in sorted(d, key=str.lower):
+        s, g, t = d[bku]
+        out.append({"Nama BKU": bku, ST_SESUAI: s, ST_GESER: g,
+                    "Total Ditemukan (Sesuai + Bergeser)": s + g, ST_TIDAK: t,
+                    "Total Sumur": s + g + t})
+    if out:
+        tot = {"Nama BKU": "TOTAL"}
+        for k in list(out[0].keys())[1:]:
+            tot[k] = sum(o[k] for o in out)
+        out.append(tot)
+    return pd.DataFrame(out)
+
+
+# ── EXCEL OUTPUT ─────────────────────────────────────────────────────────────
+HDR_BLUE, HDR_GRAY, WHITE, ZEBRA = "1F4E79", "4472C4", "FFFFFF", "F2F2F2"
+BLUE1, BLUE2 = "DDEBF7", "B4C6E7"
+FILL_STATUS = {0: ("C6EFCE", "006100"), 1: ("FFEB9C", "9C5700"), 2: ("FFC7CE", "9C0006")}
+THIN = Side(style="thin", color="AAAAAA")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+COORD_FMT = "0.##########"
+
+
+def _fill(c):
+    return PatternFill("solid", fgColor=c)
+
+
+def write_table(ws, df, title, start_row=1, row_fills=None, coord_cols=()):
+    vis = [c for c in df.columns if not str(c).startswith("_")]
+    ncol = max(len(vis), 1)
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=ncol)
+    t = ws.cell(row=start_row, column=1, value=title)
+    t.font = Font(bold=True, size=12, color=WHITE)
+    t.fill = _fill(HDR_BLUE)
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[start_row].height = 22
+
+    hr = start_row + 1
+    for ci, col in enumerate(vis, 1):
+        c = ws.cell(row=hr, column=ci, value=col)
+        c.font = Font(bold=True, size=10, color=WHITE)
+        c.fill = _fill(HDR_GRAY)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = BORDER
+    ws.row_dimensions[hr].height = 42
+
+    for ri, (_, r) in enumerate(df.iterrows()):
+        er = hr + 1 + ri
+        base = (row_fills[ri] if row_fills and row_fills[ri] else (ZEBRA if ri % 2 else WHITE))
+        is_total = str(r.get(vis[0], "")) == "TOTAL"
+        for ci, col in enumerate(vis, 1):
+            v = r[col]
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                v = ""
+            c = ws.cell(row=er, column=ci, value=v)
+            if col in coord_cols and isinstance(v, (int, float)) and v != "":
+                c.number_format = COORD_FMT
+            c.border = BORDER
+            c.font = Font(size=9, bold=is_total)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.fill = _fill("D9E1F2" if is_total else base)
+            if col in ("Status Verifikasi",) and v:
+                bg, fg = FILL_STATUS[status_priority(v)]
+                c.fill, c.font = _fill(bg), Font(size=9, bold=True, color=fg)
+            elif col == "Keterangan" and v:
+                bg, fg = {"Berpasangan": FILL_STATUS[0], "Pasangan Berulang": FILL_STATUS[1]}.get(v, FILL_STATUS[2])
+                c.fill, c.font = _fill(bg), Font(size=9, bold=True, color=fg)
+            elif col == "Status Analisa Spasial" and v:
+                bg, fg = FILL_STATUS[0] if v == "Lolos" else FILL_STATUS[2]
+                c.fill, c.font = _fill(bg), Font(size=9, bold=True, color=fg)
+            elif str(col).startswith("Status Pasangan ke") and v:
+                bg, fg = {"Berpasangan": FILL_STATUS[0], "Redundant Well": ("FCE4D6", "833C0B")}.get(v, FILL_STATUS[2])
+                c.fill, c.font = _fill(bg), Font(size=9, bold=True, color=fg)
+            elif col == "Redundant Well" and v:
+                c.fill, c.font = _fill("FCE4D6"), Font(size=9, bold=True, color="833C0B")
+    return hr + 1 + len(df)
+
+
+def group_fills(df):
+    fills, tog, prev = [], 0, None
+    for _, r in df.iterrows():
+        if r["_dup"]:
+            if r["_grup"] != prev:
+                tog ^= 1
+            fills.append(BLUE1 if tog else BLUE2)
+            prev = r["_grup"]
         else:
             fills.append(None)
-            prev_grup = None
+            prev = None
     return fills
 
 
-def build_excel_grouped(df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
-                        df_per_row, per_row_label_p,
-                        label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
-                        coord_cols, polygon_cols=None):
+def set_widths(ws, df, default=16, wide=None):
+    wide = wide or {}
+    vis = [c for c in df.columns if not str(c).startswith("_")]
+    for i, c in enumerate(vis, 1):
+        ws.column_dimensions[get_column_letter(i)].width = wide.get(c, default)
+
+
+def build_excel(df_main, df_red, df_unx, rekap_rows, df_bku_all, df_bku_pair, lbl1, lbl2,
+                df_bku_lolos=None, df_xl_sp=None, df_bku_xl_lolos=None):
     wb = Workbook()
+    coord_cols = {f"Longitude {lbl1}", f"Latitude {lbl1}", "Koordinat Database X",
+                  "Koordinat Database Y", "Koordinat Hasil Evaluasi X", "Koordinat Hasil Evaluasi Y"}
 
-    GREEN = "C6EFCE"
-    RED = "FFC7CE"
-    BLUE_HDR = "1F4E79"
-    GRAY_HDR = "595959"
-    WHITE = "FFFFFF"
-    LIGHT_GRAY = "F2F2F2"
-    thin = Side(style="thin", color="AAAAAA")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws = wb.active
+    ws.title = "Per Sumur"
+    sort_note = ("Lolos spasial → Tidak Lolos, lalu Berpasangan → Tidak Berpasangan"
+                 if "Status Analisa Spasial" in df_main.columns else "Berpasangan → Tidak Berpasangan")
+    write_table(ws, df_main, f"PER SUMUR: 1 baris = 1 nama sumur {lbl1} | urutan: {sort_note} "
+                f"| koordinat sama berurutan (biru)",
+                row_fills=group_fills(df_main), coord_cols=coord_cols)
+    set_widths(ws, df_main, wide={"No": 6, f"Nama Sumur {lbl1}": 20, f"Nama Sumur {lbl2}": 20,
+                                  "Redundant Well": 30, "Status Redundant Well": 30, "Nama BKU": 22})
+    ws.freeze_panes = "C3"
 
-    if polygon_cols is None:
-        polygon_cols = []
+    ws = wb.create_sheet("Rekap")
+    df_rek = pd.DataFrame(rekap_rows, columns=["Keterangan", "Jumlah"])
+    r = write_table(ws, df_rek, "REKAP TOTAL")
+    r = write_table(ws, df_bku_all, f"KLASIFIKASI STATUS PER NAMA BKU — SEMUA SUMUR {lbl2.upper()}",
+                    start_row=r + 2)
+    r = write_table(ws, df_bku_pair, f"KLASIFIKASI STATUS PER NAMA BKU — SUMUR {lbl2.upper()} "
+                    f"YANG BERPASANGAN DENGAN {lbl1.upper()}", start_row=r + 2)
+    if df_bku_lolos is not None:
+        r = write_table(ws, df_bku_lolos, f"KLASIFIKASI STATUS PER NAMA BKU — SUMUR {lbl2.upper()} "
+                        f"BERPASANGAN & LOLOS ANALISA SPASIAL (cek titik {lbl1})", start_row=r + 2)
+    if df_bku_xl_lolos is not None:
+        write_table(ws, df_bku_xl_lolos, f"KLASIFIKASI STATUS PER NAMA BKU — SEMUA SUMUR {lbl2.upper()} "
+                    f"LOLOS ANALISA SPASIAL (cek koordinat Database {lbl2})", start_row=r + 2)
+    ws.column_dimensions["A"].width = 52
+    for col in "BCDEF":
+        ws.column_dimensions[col].width = 20
 
-    def visible_df(df):
-        return df[[c for c in df.columns if not c.startswith("_")]]
+    if "Status Analisa Spasial" in df_main.columns:
+        df_l = df_main[df_main["Status Analisa Spasial"] == "Lolos"].reset_index(drop=True)
+        if len(df_l):
+            ws = wb.create_sheet("Lolos Analisa Spasial")
+            write_table(ws, df_l, f"LOLOS ANALISA SPASIAL ({len(df_l)} baris)",
+                        row_fills=group_fills(df_l), coord_cols=coord_cols)
+            set_widths(ws, df_l, wide={"No": 6, f"Nama Sumur {lbl1}": 20, f"Nama Sumur {lbl2}": 20,
+                                       "Redundant Well": 30, "Status Redundant Well": 30, "Nama BKU": 22})
+            ws.freeze_panes = "C3"
 
-    def write_grouped_sheet(ws, df_raw, title, stats_x, stats_y, label_x, label_y,
-                            show_stats=True, extra_stats=None, row_fills=None):
-        df = visible_df(df_raw)
-        ws.merge_cells("A1:M1")
-        tc = ws["A1"]
-        tc.value = title
-        tc.font = Font(bold=True, size=13, color=WHITE)
-        tc.fill = PatternFill("solid", fgColor=BLUE_HDR)
-        tc.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 22
+    if len(df_red):
+        ws = wb.create_sheet("Redundant Well")
+        write_table(ws, df_red, f"REDUNDANT WELL: sisa nama {lbl2} yang tidak kebagian pasangan",
+                    coord_cols=coord_cols)
+        set_widths(ws, df_red, wide={f"Grup Sumur {lbl1}": 40, "Nama BKU": 22})
 
-        for ci, col_name in enumerate(df.columns, 1):
-            cell = ws.cell(row=2, column=ci, value=col_name)
-            cell.font = Font(bold=True, size=10, color=WHITE)
-            cell.fill = PatternFill("solid", fgColor=GRAY_HDR)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = border
-        ws.row_dimensions[2].height = 32
+    if len(df_unx):
+        ws = wb.create_sheet(f"{lbl2} Tdk Berpasangan"[:31])
+        write_table(ws, df_unx, f"{lbl2.upper()} — TIDAK ADA PASANGAN DI {lbl1.upper()}"
+                    + (" (Lolos spasial di atas)" if "Status Analisa Spasial" in df_unx.columns else ""),
+                    coord_cols=coord_cols)
+        set_widths(ws, df_unx, wide={"Nama BKU": 22})
+        ws.freeze_panes = "B3"
 
-        for ri, row in enumerate(df.itertuples(index=False), start=3):
-            override = row_fills[ri - 3] if row_fills is not None else None
-            row_bg = override if override else (LIGHT_GRAY if ri % 2 == 0 else WHITE)
-            for ci, value in enumerate(row, 1):
-                col_name = df.columns[ci - 1]
-
-                # Koordinat: ANGKA full precision (tanpa round), tampil s.d. 10 desimal
-                if col_name in coord_cols:
-                    if value != "" and value is not None:
-                        try:
-                            cell = ws.cell(row=ri, column=ci, value=float(value))
-                            cell.number_format = '0.##########'
-                        except (ValueError, TypeError):
-                            cell = ws.cell(row=ri, column=ci, value=value)
-                    else:
-                        cell = ws.cell(row=ri, column=ci, value="")
-                else:
-                    cell = ws.cell(row=ri, column=ci, value=value)
-
-                cell.border = border
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.font = Font(size=9)
-
-                if col_name == "Keterangan":
-                    val_str = str(value) if value else ""
-                    if "Overlap" in val_str and "Tidak" not in val_str:
-                        cell.fill = PatternFill("solid", fgColor=GREEN)
-                        cell.font = Font(size=9, bold=True, color="006100")
-                    else:
-                        cell.fill = PatternFill("solid", fgColor=RED)
-                        cell.font = Font(size=9, bold=True, color="9C0006")
-                elif col_name == "Status Analisa Spasial":
-                    val_str = str(value) if value else ""
-                    if val_str == "Lolos":
-                        cell.fill = PatternFill("solid", fgColor=GREEN)
-                        cell.font = Font(size=9, bold=True, color="006100")
-                    elif val_str == "Tidak Lolos":
-                        cell.fill = PatternFill("solid", fgColor=RED)
-                        cell.font = Font(size=9, bold=True, color="9C0006")
-                    else:
-                        cell.fill = PatternFill("solid", fgColor=row_bg)
-                else:
-                    cell.fill = PatternFill("solid", fgColor=row_bg)
-
-        if show_stats:
-            stat_row = len(df) + 4
-
-            ws.cell(row=stat_row, column=1, value="STATISTIK").font = Font(bold=True, size=11, color=WHITE)
-            ws.cell(row=stat_row, column=1).fill = PatternFill("solid", fgColor=BLUE_HDR)
-
-            ws.cell(row=stat_row, column=2, value=label_x).font = Font(bold=True, size=10)
-            ws.cell(row=stat_row, column=2).fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-            ws.cell(row=stat_row, column=2).alignment = Alignment(horizontal="center")
-
-            ws.cell(row=stat_row, column=3, value=label_y).font = Font(bold=True, size=10)
-            ws.cell(row=stat_row, column=3).fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-            ws.cell(row=stat_row, column=3).alignment = Alignment(horizontal="center")
-
-            stat_row += 1
-
-            stats_rows = [
-                "Total Lokasi dg ≥3 Nama Sumur",
-                "Total Lokasi dg 2 Nama Sumur",
-                "Total Lokasi Single",
-                "Total Nama Sumur",
-                "Total Lokasi Unik",
-            ]
-            stat_keys = ["dup_3", "dup_2", "dup_1", "total_nama", "total_koordinat"]
-
-            for label, key in zip(stats_rows, stat_keys):
-                c1 = ws.cell(row=stat_row, column=1, value=label)
-                c1.font = Font(bold=True, size=10)
-                c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                c1.border = border
-
-                c2 = ws.cell(row=stat_row, column=2, value=stats_x.get(key, 0))
-                c2.alignment = Alignment(horizontal="center")
-                c2.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                c2.border = border
-                c2.font = Font(size=10)
-
-                c3 = ws.cell(row=stat_row, column=3, value=stats_y.get(key, 0))
-                c3.alignment = Alignment(horizontal="center")
-                c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                c3.border = border
-                c3.font = Font(size=10)
-
-                stat_row += 1
-
-            for label, val in [("Threshold Overlap antar file (meter)", threshold_m),
-                               ("Threshold Duplikat dalam file (meter)",
-                                dup_threshold_m if dup_threshold_m > 0 else "0 (identik persis)")]:
-                c1 = ws.cell(row=stat_row, column=1, value=label)
-                c1.font = Font(bold=True, size=10)
-                c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                c1.border = border
-                c3 = ws.cell(row=stat_row, column=3, value=val)
-                c3.alignment = Alignment(horizontal="center")
-                c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                c3.border = border
-                c3.font = Font(size=10)
-                stat_row += 1
-
-            if extra_stats:
-                for label, val in extra_stats:
-                    c1 = ws.cell(row=stat_row, column=1, value=label)
-                    c1.font = Font(bold=True, size=10)
-                    c1.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                    c1.border = border
-
-                    c2 = ws.cell(row=stat_row, column=2, value="")
-                    c2.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                    c2.border = border
-
-                    c3 = ws.cell(row=stat_row, column=3, value=val)
-                    c3.alignment = Alignment(horizontal="center")
-                    c3.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-                    c3.border = border
-                    c3.font = Font(size=10)
-
-                    stat_row += 1
-
-        ws.column_dimensions["A"].width = 16
-        ws.column_dimensions["B"].width = 16
-        ws.column_dimensions["C"].width = 16
-        ws.column_dimensions["D"].width = 16
-        for i in range(5, 32):
-            ws.column_dimensions[get_column_letter(i)].width = 16
-
-    # Sheet 1: Semua Data
-    ws_all = wb.active
-    ws_all.title = "Semua Data"
-    write_grouped_sheet(ws_all, df_all,
-                        f"PERBANDINGAN: {label_a} × {label_b} (overlap ≤ {threshold_m} m)",
-                        stats_a, stats_b, label_a, label_b, show_stats=True)
-
-    # Sheet 2: Per Sumur (baris = tiap nama sumur file terbanyak, urutan asli)
-    if df_per_row is not None and len(df_per_row) > 0:
-        ws_pr = wb.create_sheet("Per Sumur")
-        n_overlap_pr = len(df_per_row[df_per_row["Keterangan"] == "Overlap"])
-        n_redundant_pr = int(df_per_row["_redundant"].sum()) if "_redundant" in df_per_row.columns else 0
-        extra_stats_pr = [
-            ("Total Baris (nama sumur " + per_row_label_p + ")", len(df_per_row)),
-            ("Baris Overlap", n_overlap_pr),
-            ("Baris Tidak Overlap", len(df_per_row) - n_overlap_pr),
-            ("Baris Redundant (biru)", n_redundant_pr),
-        ]
-        if "Status Analisa Spasial" in df_per_row.columns:
-            extra_stats_pr.append(("Lolos Analisa Spasial",
-                                   len(df_per_row[df_per_row["Status Analisa Spasial"] == "Lolos"])))
-            extra_stats_pr.append(("Tidak Lolos Analisa Spasial",
-                                   len(df_per_row[df_per_row["Status Analisa Spasial"] == "Tidak Lolos"])))
-        write_grouped_sheet(ws_pr, df_per_row,
-                            f"PER SUMUR: 1 baris = 1 nama sumur {per_row_label_p} "
-                            f"(redundant dikelompokkan berurutan, warna biru)",
-                            stats_a, stats_b, label_a, label_b, show_stats=False,
-                            extra_stats=extra_stats_pr,
-                            row_fills=per_row_fills(df_per_row))
-
-    # Sheet 3: Overlap
-    if len(df_overlap) > 0:
-        ws_ov = wb.create_sheet("Overlap")
-        extra_stats_overlap = [("Jumlah Titik Overlap", len(df_overlap))]
-        if "Kesamaan Nama" in df_overlap.columns:
-            extra_stats_overlap.append(("Memiliki Nama Sama", len(df_overlap[df_overlap["Kesamaan Nama"] == "Sama"])))
-            extra_stats_overlap.append(("Memiliki Nama Berbeda", len(df_overlap[df_overlap["Kesamaan Nama"] == "Berbeda"])))
-        if "Status Analisa Spasial" in df_overlap.columns:
-            extra_stats_overlap.append(("Lolos Analisa Spasial", len(df_overlap[df_overlap["Status Analisa Spasial"] == "Lolos"])))
-            extra_stats_overlap.append(("Tidak Lolos Analisa Spasial", len(df_overlap[df_overlap["Status Analisa Spasial"] == "Tidak Lolos"])))
-        write_grouped_sheet(ws_ov, df_overlap,
-                            f"OVERLAP: {label_a} × {label_b} (jarak ≤ {threshold_m} m)",
-                            stats_a, stats_b, label_a, label_b, show_stats=True,
-                            extra_stats=extra_stats_overlap)
-
-    # Sheet 4: Hanya File A
-    if len(df_file_a_only) > 0:
-        ws_a = wb.create_sheet(f"Hanya {label_a}"[:31])
-        write_grouped_sheet(ws_a, df_file_a_only, f"HANYA {label_a.upper()}",
-                            stats_a, {}, label_a, label_b, show_stats=False)
-
-    # Sheet 5: Hanya File B
-    if len(df_file_b_only) > 0:
-        ws_b = wb.create_sheet(f"Hanya {label_b}"[:31])
-        write_grouped_sheet(ws_b, df_file_b_only, f"HANYA {label_b.upper()}",
-                            {}, stats_b, label_a, label_b, show_stats=False)
-
-    # Sheet 6: Lolos Analisa Spasial
-    if df_lolos_spasial is not None and len(df_lolos_spasial) > 0:
-        ws_lolos = wb.create_sheet("Lolos Analisa Spasial")
-        extra_stats_lolos = [("Jumlah Titik Lolos Analisa Spasial", len(df_lolos_spasial))]
-        if "Kesamaan Nama" in df_lolos_spasial.columns:
-            extra_stats_lolos.append(("Memiliki Nama Sama", len(df_lolos_spasial[df_lolos_spasial["Kesamaan Nama"] == "Sama"])))
-            extra_stats_lolos.append(("Memiliki Nama Berbeda", len(df_lolos_spasial[df_lolos_spasial["Kesamaan Nama"] == "Berbeda"])))
-        write_grouped_sheet(ws_lolos, df_lolos_spasial, "LOLOS ANALISA SPASIAL",
-                            stats_a, stats_b, label_a, label_b, show_stats=False,
-                            extra_stats=extra_stats_lolos)
+    if df_xl_sp is not None and len(df_xl_sp):
+        ws = wb.create_sheet(f"{lbl2} Analisa Spasial"[:31])
+        n_l = int((df_xl_sp["Status Analisa Spasial"] == "Lolos").sum())
+        write_table(ws, df_xl_sp, f"{lbl2.upper()} — ANALISA SPASIAL KOORDINAT DATABASE "
+                    f"(Lolos {n_l} | Tidak Lolos {len(df_xl_sp) - n_l}) — Lolos di atas",
+                    coord_cols=coord_cols)
+        set_widths(ws, df_xl_sp, wide={"Nama BKU": 22, f"Pasangan {lbl1}": 30,
+                                       f"Status Pasangan ke {lbl1}": 18})
+        ws.freeze_panes = "B3"
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
     return buf.getvalue()
 
 
+def make_rekap(kmz_recs, xl_recs, xl_skipped, df_main, df_red, df_unx, ck, cx, lbl1, lbl2, thr, dup):
+    ket = df_main["Keterangan"].value_counts() if len(df_main) else {}
+    paired_names = len(xl_recs) - len(df_unx) - len(df_red)
+    return [
+        (f"Total nama sumur {lbl1}", len(kmz_recs)),
+        (f"Total lokasi/koordinat unik {lbl1}", len(ck)),
+        (f"Lokasi {lbl1} dengan ≥2 nama (duplikat)", sum(len(c['recs']) > 1 for c in ck)),
+        (f"Total nama sumur {lbl2} (koordinat valid)", len(xl_recs)),
+        (f"Baris {lbl2} dilewati (koordinat kosong/invalid)", len(xl_skipped)),
+        (f"Total lokasi/koordinat unik {lbl2}", len(cx)),
+        (f"Baris {lbl1} — Berpasangan", int(ket.get("Berpasangan", 0))),
+        (f"Baris {lbl1} — Pasangan Berulang", int(ket.get("Pasangan Berulang", 0))),
+        (f"Baris {lbl1} — Tidak Berpasangan", int(ket.get("Tidak Berpasangan", 0))),
+        (f"Nama {lbl2} terpasang ke {lbl1}", paired_names),
+        (f"Nama {lbl2} masuk Redundant Well", len(df_red)),
+        (f"Nama {lbl2} tidak ada pasangan di {lbl1}", len(df_unx)),
+    ] + spasial_rekap(df_main, lbl1) + [
+        ("Threshold pasangan antar file (meter)", thr),
+        ("Threshold duplikat dalam file (meter)", dup if dup > 0 else "0 (identik persis)"),
+    ]
+
+
+def spasial_rekap_xl(df, lbl2, lbl1):
+    if df is None or "Status Analisa Spasial" not in df.columns:
+        return []
+    lol = df["Status Analisa Spasial"] == "Lolos"
+    out = [(f"Nama {lbl2} — Lolos Analisa Spasial", int(lol.sum())),
+           (f"Nama {lbl2} — Tidak Lolos Analisa Spasial", int((~lol).sum()))]
+    stc = f"Status Pasangan ke {lbl1}"
+    for stp in ("Berpasangan", "Redundant Well", "Tidak Berpasangan"):
+        m = df[stc] == stp
+        out.append((f"Nama {lbl2} — Lolos & {stp}", int((lol & m).sum())))
+    return out
+
+
+def spasial_rekap(df, lbl1):
+    if "Status Analisa Spasial" not in df.columns:
+        return []
+    lol = df["Status Analisa Spasial"] == "Lolos"
+    pair = df["Keterangan"] != "Tidak Berpasangan"
+    return [
+        (f"Baris {lbl1} — Lolos Analisa Spasial", int(lol.sum())),
+        (f"Baris {lbl1} — Tidak Lolos Analisa Spasial", int((~lol).sum())),
+        (f"Baris {lbl1} — Lolos & Berpasangan", int((lol & pair).sum())),
+        (f"Baris {lbl1} — Lolos & Tidak Berpasangan", int((lol & ~pair).sum())),
+        (f"Baris {lbl1} — Tidak Lolos & Berpasangan", int((~lol & pair).sum())),
+        (f"Baris {lbl1} — Tidak Lolos & Tidak Berpasangan", int((~lol & ~pair).sum())),
+    ]
+
+
 # ── UI ───────────────────────────────────────────────────────────────────────
+def label_of(f, default):
+    return os.path.splitext(f.name)[0].replace("_", " ").replace("-", " ") if f else default
 
-st.title("🗺️ KML/KMZ Compare + Polygon Classifier")
-st.caption("Overlap antar file = jarak haversine ≤ threshold. Koordinat A & B ditampilkan terpisah, full precision (string asli file). Duplikat intra-file default hanya koordinat identik persis. Sheet 'Per Sumur' = 1 baris per nama sumur file terbanyak, urutan asli.")
 
-with st.sidebar:
-    st.header("⚙️ Pengaturan")
-    threshold_m = st.number_input(
-        "Threshold overlap ANTAR file (meter)",
-        min_value=0.1, max_value=10_000.0, value=5.0, step=1.0,
-        help="Titik File 1 dan File 2 dianggap OVERLAP kalau jarak haversine ≤ nilai ini."
-    )
-    dup_threshold_m = st.number_input(
-        "Threshold duplikat DALAM satu file (meter)",
-        min_value=0.0, max_value=1_000.0, value=0.0, step=1.0,
-        help="0 (default) = hanya titik dengan koordinat IDENTIK PERSIS yang digabung "
-             "jadi satu lokasi. Sumur berbeda yang berdekatan (mis. 3-4 m) tetap "
-             "jadi baris terpisah dengan koordinat masing-masing. "
-             "Isi > 0 kalau memang mau gabungkan titik berdekatan dalam satu file."
-    )
-    st.caption(f"Overlap antar file: ≤ {threshold_m:g} m | Duplikat intra-file: "
-               f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
+def main():
+    st.set_page_config(page_title="KMZ vs Excel — Per Sumur", page_icon="🛢️", layout="wide")
+    st.title("🛢️ KMZ vs Excel — Per Sumur")
+    st.caption("Baris output = nama sumur File 1 (KMZ). Pasangan dari File 2 (Excel) "
+               "berdasarkan jarak koordinat Database X/Y.")
 
-    st.markdown("---")
-    use_polygon = st.checkbox("🗺️ Gunakan Polygon Classifier", value=False)
+    with st.sidebar:
+        st.header("⚙️ Pengaturan")
+        thr = st.number_input("Threshold pasangan antar file (m)", 0.01, 10_000.0, 1.0, 0.5,
+                              help="Lokasi KMZ & Excel dianggap pasangan kalau jarak ≤ nilai ini.")
+        dup = st.number_input("Threshold duplikat dalam file (m)", 0.0, 1_000.0, 0.0, 0.5,
+                              help="0 = hanya koordinat identik persis dianggap 1 lokasi.")
+        lbl1 = st.text_input("Label File 1", "KMZ")
+        lbl2 = st.text_input("Label File 2", "Excel")
+        st.markdown("---")
+        use_poly = st.checkbox("🗺️ Gunakan Polygon Classifier", value=False)
 
-col1, col2 = st.columns(2)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("📂 File 1 — KML/KMZ")
+        f1 = st.file_uploader("Upload KML/KMZ", type=["kml", "kmz"], key="f1")
+    with c2:
+        st.subheader("📂 File 2 — Excel")
+        f2 = st.file_uploader("Upload Excel", type=["xlsx", "xls"], key="f2")
+        sheet = 0
+        if f2:
+            xls = pd.ExcelFile(f2)
+            sheet = st.selectbox("Sheet", xls.sheet_names)
 
-with col1:
-    st.subheader("📂 File 1")
-    file_a = st.file_uploader("Upload KML/KMZ", type=["kml", "kmz"], key="file_a")
-    label_a = filename_to_label(file_a) if file_a else "File 1"
-    st.text_input("Label", value=label_a, key="label_a_display", disabled=True)
-
-with col2:
-    st.subheader("📂 File 2")
-    file_b = st.file_uploader("Upload KML/KMZ", type=["kml", "kmz"], key="file_b")
-    label_b = filename_to_label(file_b) if file_b else "File 2"
-    st.text_input("Label", value=label_b, key="label_b_display", disabled=True)
-
-# Polygon Classifier Section
-polygon_slots = []
-polygon_rules = {}
-
-if use_polygon:
-    st.markdown("---")
-    st.subheader("🗺️ Polygon Classifier (1-5 Polygon)")
-
-    rule_options = ["Hanya Info (tidak difilter)", "Lolos jika Dalam", "Lolos jika Luar"]
-
-    for i in range(1, 6):
-        required_tag = " *(wajib)*" if i == 1 else " *(opsional)*"
-        with st.expander(f"Polygon {i}{required_tag}", expanded=(i == 1)):
-            pfile = st.file_uploader(f"File Polygon {i}", type=['kml', 'kmz'],
-                                      accept_multiple_files=False, key=f"poly_{i}",
+    poly_slots = []
+    if use_poly:
+        st.markdown("---")
+        st.subheader("🗺️ Polygon Classifier (1–5 polygon)")
+        st.caption("Per Sumur dicek pakai koordinat File 1 (KMZ). Sheet File 2 dicek pakai "
+                   "Koordinat Database X/Y. Baris Lolos ditaruh paling atas.")
+        for i in range(1, 6):
+            with st.expander(f"Polygon {i}" + (" (wajib)" if i == 1 else " (opsional)"), expanded=(i == 1)):
+                pf = st.file_uploader(f"File Polygon {i}", type=["kml", "kmz"], key=f"poly_{i}",
                                       label_visibility="collapsed")
-            if pfile:
-                default_name = os.path.splitext(pfile.name)[0]
-                pname = st.text_input(f"Nama Polygon {i}", value=default_name, key=f"pname_{i}")
-                prule = st.selectbox(f"Rule Polygon {i}", rule_options, key=f"prule_{i}")
-                polygon_slots.append({'idx': i, 'file': pfile, 'name': pname, 'rule': prule})
+                if pf:
+                    pn = st.text_input(f"Nama Polygon {i}", os.path.splitext(pf.name)[0], key=f"pn_{i}")
+                    pr = st.selectbox(f"Rule Polygon {i}", POLY_RULES, index=1, key=f"pr_{i}")
+                    poly_slots.append({"idx": i, "file": pf, "name": pn, "rule": pr})
 
-if st.button("🚀 PROSES", type="primary", use_container_width=True):
+    if not st.button("🚀 PROSES", type="primary", use_container_width=True):
+        return
+    if not f1 or not f2:
+        st.error("Upload 2 file dulu.")
+        return
+    if use_poly and not poly_slots:
+        st.error("Polygon Classifier aktif, upload minimal 1 polygon.")
+        return
 
-    if not file_a or not file_b:
-        st.error("⚠️ Upload 2 file dulu.")
-        st.stop()
+    try:
+        with st.spinner("Memproses..."):
+            kmz = parse_kml_points(read_kml_bytes(f1))
+            xl, xl_skip, _ = parse_excel(f2, sheet)
+            if not kmz:
+                st.error("Tidak ada titik terbaca di KMZ.")
+                return
+            if not xl:
+                st.error("Tidak ada baris valid di Excel.")
+                return
 
-    if use_polygon and not polygon_slots:
-        st.error("⚠️ Polygon Classifier aktif, upload minimal 1 polygon.")
-        st.stop()
+            df_main, df_red, df_unx, ck, cx, paired, df_xl_all = build(kmz, xl, thr, dup, lbl1, lbl2)
+            xl_paired = [x for x, _ in paired]
 
-    with st.spinner("Memproses..."):
-        try:
-            label_a = filename_to_label(file_a) or "File 1"
-            label_b = filename_to_label(file_b) or "File 2"
+            polygons = []
+            for sl in poly_slots:
+                geoms = parse_kml_polygons(read_kml_bytes(sl["file"]))
+                if not geoms:
+                    st.warning(f"Polygon {sl['idx']}: tidak ada polygon terbaca, dilewati.")
+                    continue
+                polygons.append({"col": f"Polygon {sl['idx']} ({sl['name']})",
+                                 "geom": unary_union(geoms), "rule": sl["rule"]})
+            df_main = apply_polygons(df_main, polygons, f"Longitude {lbl1}", f"Latitude {lbl1}")
+            df_unx = sort_spasial(apply_polygons(df_unx, polygons,
+                                                 "Koordinat Database X", "Koordinat Database Y"))
+            df_xl_sp, df_bku_xl_lolos = None, None
+            if polygons:
+                df_xl_sp = sort_spasial(apply_polygons(df_xl_all, polygons,
+                                                       "Koordinat Database X", "Koordinat Database Y"))
+                lol_mask = df_xl_sp["Status Analisa Spasial"] == "Lolos"
+                df_bku_xl_lolos = bku_table([{"Nama BKU": b or None, "_prio": p} for b, p in
+                                             zip(df_xl_sp.loc[lol_mask, "Nama BKU"],
+                                                 df_xl_sp.loc[lol_mask, "_prio"])])
 
-            kml_bytes_a = extract_kml_bytes(file_a)
-            kml_bytes_b = extract_kml_bytes(file_b)
+            df_bku_lolos = None
+            if polygons:
+                lolos_no = set(df_main.loc[df_main["Status Analisa Spasial"] == "Lolos", "No"])
+                df_bku_lolos = bku_table([x for x, nos in paired if lolos_no.intersection(nos)])
 
-            if kml_bytes_a is None or kml_bytes_b is None:
-                st.stop()
+            df_main, df_red = sort_per_sumur(df_main, df_red)
 
-            recs_a = parse_kml(kml_bytes_a, label_a)
-            recs_b = parse_kml(kml_bytes_b, label_b)
+            rekap = make_rekap(kmz, xl, xl_skip, df_main, df_red, df_unx, ck, cx,
+                               lbl1, lbl2, thr, dup)
+            rekap = rekap[:-2] + spasial_rekap_xl(df_xl_sp, lbl2, lbl1) + rekap[-2:]
+            df_bku_all = bku_table(xl + xl_skip)
+            df_bku_pair = bku_table(xl_paired)
+            out = build_excel(df_main, df_red, df_unx, rekap, df_bku_all, df_bku_pair, lbl1, lbl2,
+                              df_bku_lolos, df_xl_sp, df_bku_xl_lolos)
 
-            if not recs_a or not recs_b:
-                st.error("❌ Tidak ada titik yang terbaca.")
-                st.stop()
+        m = st.columns(6 if polygons else 5)
+        m[0].metric(f"Nama {lbl1}", len(kmz))
+        m[1].metric(f"Nama {lbl2}", len(xl))
+        m[2].metric("Berpasangan", int((df_main["Keterangan"] == "Berpasangan").sum()))
+        m[3].metric("Tidak Berpasangan", int((df_main["Keterangan"] == "Tidak Berpasangan").sum()))
+        m[4].metric("Redundant Well", len(df_red))
+        if polygons:
+            m[5].metric("Lolos Spasial", int((df_main["Status Analisa Spasial"] == "Lolos").sum()))
+        if xl_skip:
+            st.warning(f"{len(xl_skip)} baris Excel dilewati (koordinat Database kosong/invalid).")
 
-            st.success(f"**{label_a}**: {len(recs_a)} titik | **{label_b}**: {len(recs_b)} titik | "
-                       f"Overlap ≤ {threshold_m:g} m | Duplikat intra-file: "
-                       f"{'identik persis' if dup_threshold_m == 0 else f'≤ {dup_threshold_m:g} m'}")
-
-            (df_all, max_dup_a, max_dup_b, stats_a, stats_b, coord_cols,
-             clusters_a, clusters_b, matches) = build_grouped_comparison(
-                recs_a, recs_b, threshold_m, dup_threshold_m, label_a, label_b
-            )
-
-            df_overlap = df_all[df_all["Keterangan"] == "Overlap"].reset_index(drop=True)
-            df_file_a_only = df_all[(df_all["Keterangan"] == "Tidak Overlap") &
-                                    (df_all[f"Jumlah Sumur {label_a}"] > 0)].reset_index(drop=True)
-            df_file_b_only = df_all[(df_all["Keterangan"] == "Tidak Overlap") &
-                                    (df_all[f"Jumlah Sumur {label_b}"] > 0)].reset_index(drop=True)
-
-            # Sheet Per Sumur: baris = tiap nama sumur di file terbanyak, urutan asli
-            df_per_row, per_row_label_p, per_row_label_s = build_per_row_comparison(
-                recs_a, recs_b, clusters_a, clusters_b, matches, label_a, label_b
-            )
-
-            # Polygon Classifier
-            polygon_cols_list = []
-            df_lolos_spasial = None
-
-            if use_polygon:
-                for slot in polygon_slots:
-                    poly_kml = extract_kml_bytes(slot['file'])
-                    if poly_kml is None:
-                        continue
-
-                    polys = extract_polygons_from_kml(poly_kml)
-                    if not polys:
-                        st.warning(f"⚠️ Tidak ada polygon di file Polygon {slot['idx']}, dilewati.")
-                        continue
-
-                    union_poly = unary_union(polys)
-                    col_name = f"Polygon {slot['idx']} ({slot['name']})"
-                    polygon_cols_list.append(col_name)
-                    polygon_rules[col_name] = slot['rule']
-
-                    for df in [df_all, df_overlap, df_file_a_only, df_file_b_only, df_per_row]:
-                        df[col_name] = df.apply(
-                            lambda r: 'Dalam' if union_poly.covers(Point(r['_lon'], r['_lat'])) else 'Luar',
-                            axis=1
-                        )
-
-                def check_lolos_spasial(row):
-                    for col_name, rule in polygon_rules.items():
-                        if col_name in row.index:
-                            status = row[col_name]
-                            if rule == "Lolos jika Dalam" and status != 'Dalam':
-                                return "Tidak Lolos"
-                            elif rule == "Lolos jika Luar" and status != 'Luar':
-                                return "Tidak Lolos"
-                    return "Lolos"
-
-                for df in [df_all, df_overlap, df_file_a_only, df_file_b_only, df_per_row]:
-                    df["Status Analisa Spasial"] = df.apply(check_lolos_spasial, axis=1)
-
-                df_lolos_spasial = df_overlap[df_overlap["Status Analisa Spasial"] == "Lolos"].reset_index(drop=True)
-
-            # Metrics
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(f"Lokasi {label_a}", stats_a["total_koordinat"])
-            m2.metric(f"Lokasi {label_b}", stats_b["total_koordinat"])
-            m3.metric("Overlap", len(df_overlap))
-            if use_polygon and df_lolos_spasial is not None:
-                m4.metric("Lolos Spasial", len(df_lolos_spasial))
-            else:
-                m4.metric("Max Duplikat", f"{max_dup_a}/{max_dup_b}")
-
-            st.markdown("---")
-
-            def preview(df):
-                return df[[c for c in df.columns if not c.startswith("_")]]
-
-            tab_labels = [
-                f"Semua ({len(df_all)})",
-                f"Per Sumur ({len(df_per_row)})",
-                f"Overlap ({len(df_overlap)})",
-                f"Hanya {label_a} ({len(df_file_a_only)})",
-                f"Hanya {label_b} ({len(df_file_b_only)})",
-            ]
-            if use_polygon:
-                tab_labels.append(f"Lolos Spasial ({len(df_lolos_spasial)})")
-
-            tabs = st.tabs(tab_labels)
-
-            with tabs[0]:
-                st.dataframe(preview(df_all), use_container_width=True, height=400)
-            with tabs[1]:
-                st.caption(f"1 baris = 1 nama sumur **{per_row_label_p}** (file terbanyak). "
-                           f"Redundant (koordinat sama) dikelompokkan berurutan → di Excel diberi warna biru. "
-                           f"Nama {per_row_label_s} digabung pakai koma.")
-                st.dataframe(preview(df_per_row), use_container_width=True, height=400)
-            with tabs[2]:
-                st.dataframe(preview(df_overlap), use_container_width=True, height=400)
-            with tabs[3]:
-                st.dataframe(preview(df_file_a_only), use_container_width=True, height=400) if len(df_file_a_only) > 0 else st.info("Kosong")
+        vis = lambda d: d[[c for c in d.columns if not str(c).startswith("_")]]
+        tab_names = [f"Per Sumur ({len(df_main)})", "Rekap",
+                     f"Redundant ({len(df_red)})", f"{lbl2} Tdk Berpasangan ({len(df_unx)})"]
+        if df_xl_sp is not None:
+            tab_names.append(f"{lbl2} Analisa Spasial ({len(df_xl_sp)})")
+        tabs = st.tabs(tab_names)
+        with tabs[0]:
+            st.dataframe(vis(df_main), use_container_width=True, height=450)
+        with tabs[1]:
+            st.dataframe(pd.DataFrame(rekap, columns=["Keterangan", "Jumlah"]).astype(str),
+                         use_container_width=True, hide_index=True)
+            st.markdown("**Status per Nama BKU — semua sumur File 2**")
+            st.dataframe(df_bku_all, use_container_width=True, hide_index=True)
+            st.markdown("**Status per Nama BKU — sumur File 2 yang berpasangan**")
+            st.dataframe(df_bku_pair, use_container_width=True, hide_index=True)
+            if df_bku_lolos is not None:
+                st.markdown("**Status per Nama BKU — berpasangan & lolos spasial**")
+                st.dataframe(df_bku_lolos, use_container_width=True, hide_index=True)
+            if df_bku_xl_lolos is not None:
+                st.markdown("**Status per Nama BKU — semua sumur File 2 lolos spasial**")
+                st.dataframe(df_bku_xl_lolos, use_container_width=True, hide_index=True)
+        with tabs[2]:
+            st.dataframe(vis(df_red), use_container_width=True) if len(df_red) else st.info("Kosong")
+        with tabs[3]:
+            st.dataframe(df_unx, use_container_width=True) if len(df_unx) else st.info("Kosong")
+        if df_xl_sp is not None:
             with tabs[4]:
-                st.dataframe(preview(df_file_b_only), use_container_width=True, height=400) if len(df_file_b_only) > 0 else st.info("Kosong")
+                st.dataframe(vis(df_xl_sp), use_container_width=True, height=450)
 
-            if use_polygon:
-                with tabs[5]:
-                    st.dataframe(preview(df_lolos_spasial), use_container_width=True, height=400) if len(df_lolos_spasial) > 0 else st.info("Kosong")
+        st.download_button("📥 Download Excel", out,
+                           file_name=f"Compare_{lbl1}_vs_{lbl2}.xlsx".replace(" ", "_"),
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary", use_container_width=True)
+    except Exception as e:
+        import traceback
+        st.error(f"Error: {e}")
+        st.code(traceback.format_exc())
 
-            st.markdown("---")
 
-            excel_bytes = build_excel_grouped(
-                df_all, df_overlap, df_file_a_only, df_file_b_only, df_lolos_spasial,
-                df_per_row, per_row_label_p,
-                label_a, label_b, stats_a, stats_b, threshold_m, dup_threshold_m,
-                coord_cols, polygon_cols_list
-            )
-
-            fn = f"Compare_{label_a}_vs_{label_b}.xlsx".replace(" ", "_")
-            st.download_button(
-                label="📥 Download Excel",
-                data=excel_bytes,
-                file_name=fn,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
-            )
-
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+if __name__ == "__main__":
+    main()
