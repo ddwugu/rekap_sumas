@@ -584,7 +584,7 @@ def set_widths(ws, df, default=16, wide=None):
 
 
 def build_excel(df_main, df_red, df_unx, rekap_rows, df_bku_all, df_bku_pair, lbl1, lbl2,
-                df_bku_lolos=None, df_xl_sp=None, df_bku_xl_lolos=None):
+                df_bku_lolos=None, df_xl_sp=None, df_bku_xl_lolos=None, df_xpair=None):
     wb = Workbook()
     coord_cols = {f"Longitude {lbl1}", f"Latitude {lbl1}", "Koordinat Database X",
                   "Koordinat Database Y", "Koordinat Hasil Evaluasi X", "Koordinat Hasil Evaluasi Y"}
@@ -632,6 +632,18 @@ def build_excel(df_main, df_red, df_unx, rekap_rows, df_bku_all, df_bku_pair, lb
         write_table(ws, df_red, f"REDUNDANT WELL: sisa nama {lbl2} yang tidak kebagian pasangan",
                     coord_cols=coord_cols)
         set_widths(ws, df_red, wide={f"Grup Sumur {lbl1}": 40, "Nama BKU": 22})
+
+    if df_xpair is not None and len(df_xpair):
+        ws = wb.create_sheet(f"{lbl2} Berpasangan"[:31])
+        stc = f"Status Pasangan ke {lbl1}"
+        n_b = int((df_xpair[stc] == "Berpasangan").sum())
+        note = "Lolos spasial di atas, " if "Status Analisa Spasial" in df_xpair.columns else ""
+        write_table(ws, df_xpair, f"{lbl2.upper()} — BERPASANGAN DI {lbl1.upper()} "
+                    f"(Berpasangan {n_b} | Redundant Well {len(df_xpair) - n_b}) — "
+                    f"{note}Berpasangan lalu Redundant",
+                    coord_cols=coord_cols)
+        set_widths(ws, df_xpair, wide={"Nama BKU": 22, f"Pasangan {lbl1}": 30, stc: 18})
+        ws.freeze_panes = "B3"
 
     if len(df_unx):
         ws = wb.create_sheet(f"{lbl2} Tdk Berpasangan"[:31])
@@ -790,9 +802,17 @@ def main():
             df_unx = sort_spasial(apply_polygons(df_unx, polygons,
                                                  "Koordinat Database X", "Koordinat Database Y"))
             df_xl_sp, df_bku_xl_lolos = None, None
+            df_xl_cls = apply_polygons(df_xl_all, polygons, "Koordinat Database X", "Koordinat Database Y")
+            # Excel Berpasangan = Berpasangan + Redundant Well (ada di koordinat pasangan)
+            stc = f"Status Pasangan ke {lbl1}"
+            df_xpair = df_xl_cls[df_xl_cls[stc] != "Tidak Berpasangan"].copy()
+            df_xpair["_kp"] = (df_xpair[stc] != "Berpasangan").astype(int)
+            df_xpair["_ks"] = ((df_xpair["Status Analisa Spasial"] != "Lolos").astype(int)
+                               if "Status Analisa Spasial" in df_xpair.columns else 0)
+            df_xpair = (df_xpair.sort_values(["_ks", "_kp", "_order"], kind="stable")
+                        .drop(columns=["_kp", "_ks"]).reset_index(drop=True))
             if polygons:
-                df_xl_sp = sort_spasial(apply_polygons(df_xl_all, polygons,
-                                                       "Koordinat Database X", "Koordinat Database Y"))
+                df_xl_sp = sort_spasial(df_xl_cls)
                 lol_mask = df_xl_sp["Status Analisa Spasial"] == "Lolos"
                 df_bku_xl_lolos = bku_table([{"Nama BKU": b or None, "_prio": p} for b, p in
                                              zip(df_xl_sp.loc[lol_mask, "Nama BKU"],
@@ -810,8 +830,13 @@ def main():
             rekap = rekap[:-2] + spasial_rekap_xl(df_xl_sp, lbl2, lbl1) + rekap[-2:]
             df_bku_all = bku_table(xl + xl_skip)
             df_bku_pair = bku_table(xl_paired)
+            rekap = rekap[:-2] + [
+                (f"CEK: Nama {lbl2} Berpasangan (termasuk Redundant) + Tidak Berpasangan",
+                 f"{len(df_xpair)} + {len(df_unx)} = {len(df_xpair) + len(df_unx)} "
+                 f"(total {len(xl)} → {'OK' if len(df_xpair) + len(df_unx) == len(xl) else 'SELISIH'})"),
+            ] + rekap[-2:]
             out = build_excel(df_main, df_red, df_unx, rekap, df_bku_all, df_bku_pair, lbl1, lbl2,
-                              df_bku_lolos, df_xl_sp, df_bku_xl_lolos)
+                              df_bku_lolos, df_xl_sp, df_bku_xl_lolos, df_xpair)
 
         m = st.columns(6 if polygons else 5)
         m[0].metric(f"Nama {lbl1}", len(kmz))
@@ -826,7 +851,8 @@ def main():
 
         vis = lambda d: d[[c for c in d.columns if not str(c).startswith("_")]]
         tab_names = [f"Per Sumur ({len(df_main)})", "Rekap",
-                     f"Redundant ({len(df_red)})", f"{lbl2} Tdk Berpasangan ({len(df_unx)})"]
+                     f"Redundant ({len(df_red)})", f"{lbl2} Tdk Berpasangan ({len(df_unx)})",
+                     f"{lbl2} Berpasangan ({len(df_xpair)})"]
         if df_xl_sp is not None:
             tab_names.append(f"{lbl2} Analisa Spasial ({len(df_xl_sp)})")
         tabs = st.tabs(tab_names)
@@ -849,8 +875,10 @@ def main():
             st.dataframe(vis(df_red), use_container_width=True) if len(df_red) else st.info("Kosong")
         with tabs[3]:
             st.dataframe(df_unx, use_container_width=True) if len(df_unx) else st.info("Kosong")
+        with tabs[4]:
+            st.dataframe(vis(df_xpair), use_container_width=True) if len(df_xpair) else st.info("Kosong")
         if df_xl_sp is not None:
-            with tabs[4]:
+            with tabs[5]:
                 st.dataframe(vis(df_xl_sp), use_container_width=True, height=450)
 
         st.download_button("📥 Download Excel", out,
